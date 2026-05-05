@@ -236,7 +236,8 @@ public final class OpenCodeSessionStore: OpenCodeSessionStoring, ModeAwareOpenCo
             cwd: session.directory,
             status: .unknown,
             startedAt: session.createdAt,
-            lastActivityAt: session.updatedAt
+            lastActivityAt: session.updatedAt,
+            statusEvidence: AgentStatusEvidence(evidenceObservedAt: session.updatedAt)
         )
     }
 
@@ -251,6 +252,7 @@ public final class OpenCodeSessionStore: OpenCodeSessionStoring, ModeAwareOpenCo
         var activeTool: ToolCallSummary?
         var didError = false
         var activity: ProviderActivity = .unknown
+        var statusEvidence = AgentStatusEvidence(evidenceObservedAt: session.updatedAt)
         var diagnostics: [String] = []
 
         for row in parts {
@@ -260,23 +262,34 @@ public final class OpenCodeSessionStore: OpenCodeSessionStoring, ModeAwareOpenCo
             }
             let type = JSONHelpers.string(json, keys: ["type"])
             if type == "step-finish" {
+                markAssistantOrToolActivity(row: row, evidence: &statusEvidence)
                 tokenUsage = JSONHelpers.tokenUsage(from: JSONHelpers.dictionary(json, key: "tokens")) ?? tokenUsage
                 costUSD = JSONHelpers.decimal(json, keys: ["cost"]) ?? costUSD
                 if JSONHelpers.string(json, keys: ["reason"]) == "error" {
                     didError = true
                     activity = .errored
+                    statusEvidence.providerTerminalState = .error
                 }
             }
             if type == "tool", activeTool == nil {
+                markAssistantOrToolActivity(row: row, evidence: &statusEvidence)
                 let toolState = parseToolState(json, row: row, now: now)
                 if toolState.isError {
                     didError = true
                     activity = .errored
+                    statusEvidence.providerTerminalState = .error
                 }
                 activeTool = toolState.tool
                 if toolState.isActive {
                     activity = .active
+                    statusEvidence.providerTerminalState = .running
+                    statusEvidence.openActivityKind = .toolCall
+                    statusEvidence.openActivityStartedAt = toolState.tool?.startedAt ?? row.createdAt
+                    statusEvidence.openActivityUpdatedAt = row.updatedAt ?? toolState.tool?.startedAt ?? row.createdAt
                 }
+            }
+            if ["text", "reasoning", "file", "patch"].contains(type ?? "") {
+                markAssistantOrToolActivity(row: row, evidence: &statusEvidence)
             }
             if costUSD == nil {
                 costUSD = JSONHelpers.decimal(json, keys: ["cost"])
@@ -288,27 +301,43 @@ public final class OpenCodeSessionStore: OpenCodeSessionStoring, ModeAwareOpenCo
                 diagnostics.append(Diagnostics.openCode("malformed message JSON in \(session.id)"))
                 continue
             }
+            markMessageActivity(json, row: row, evidence: &statusEvidence)
             tokenUsage = JSONHelpers.tokenUsage(from: JSONHelpers.dictionary(json, key: "tokens")) ?? tokenUsage
             costUSD = JSONHelpers.decimal(json, keys: ["cost"]) ?? costUSD
             if json["error"] != nil {
                 didError = true
                 activity = .errored
+                statusEvidence.providerTerminalState = .error
             }
             switch finishState(json) {
             case .active:
                 if activity != .errored {
                     activity = .active
+                    statusEvidence.providerTerminalState = .running
+                    if statusEvidence.openActivityKind == nil {
+                        statusEvidence.openActivityKind = .modelTurn
+                        statusEvidence.openActivityStartedAt = row.createdAt
+                        statusEvidence.openActivityUpdatedAt = row.updatedAt ?? row.createdAt
+                    }
                 }
             case .finished:
                 if activity != .errored {
                     activity = .finished
+                    statusEvidence.providerTerminalState = .complete
+                    clearOpenActivity(evidence: &statusEvidence)
                 }
             case .errored:
                 didError = true
                 activity = .errored
+                statusEvidence.providerTerminalState = .error
+                clearOpenActivity(evidence: &statusEvidence)
             case .unknown:
                 break
             }
+        }
+        statusEvidence.providerTerminalState = didError ? .error : activity.providerTerminalState
+        if activeTool == nil {
+            clearOpenActivity(evidence: &statusEvidence)
         }
 
         return AgentSummary(
@@ -322,6 +351,7 @@ public final class OpenCodeSessionStore: OpenCodeSessionStoring, ModeAwareOpenCo
             tokenUsage: tokenUsage,
             costUSD: costUSD,
             activeTool: activeTool,
+            statusEvidence: statusEvidence,
             diagnostics: diagnostics
         )
     }
@@ -386,6 +416,35 @@ public final class OpenCodeSessionStore: OpenCodeSessionStoring, ModeAwareOpenCo
         }
         return String(cString: text)
     }
+
+    private func markMessageActivity(_ json: JSONDictionary, row: OpenCodeJSONRow, evidence: inout AgentStatusEvidence) {
+        let timestamp = row.updatedAt ?? row.createdAt
+        if JSONHelpers.string(json, keys: ["role"]) == "user" {
+            evidence.lastUserInputAt = maxDate(evidence.lastUserInputAt, timestamp)
+        } else {
+            evidence.lastAssistantOrToolActivityAt = maxDate(evidence.lastAssistantOrToolActivityAt, timestamp)
+        }
+    }
+
+    private func markAssistantOrToolActivity(row: OpenCodeJSONRow, evidence: inout AgentStatusEvidence) {
+        evidence.lastAssistantOrToolActivityAt = maxDate(evidence.lastAssistantOrToolActivityAt, row.updatedAt ?? row.createdAt)
+    }
+
+    private func clearOpenActivity(evidence: inout AgentStatusEvidence) {
+        evidence.openActivityKind = nil
+        evidence.openActivityStartedAt = nil
+        evidence.openActivityUpdatedAt = nil
+    }
+
+    private func maxDate(_ lhs: Date?, _ rhs: Date?) -> Date? {
+        guard let rhs else {
+            return lhs
+        }
+        guard let lhs else {
+            return rhs
+        }
+        return max(lhs, rhs)
+    }
 }
 
 struct OpenCodeSessionRow: Sendable {
@@ -437,6 +496,19 @@ fileprivate enum ProviderActivity: Sendable {
     case unknown
 
     var agentStatus: AgentStatus {
+        switch self {
+        case .active:
+            .running
+        case .finished:
+            .complete
+        case .errored:
+            .error
+        case .unknown:
+            .unknown
+        }
+    }
+
+    var providerTerminalState: ProviderTerminalState {
         switch self {
         case .active:
             .running

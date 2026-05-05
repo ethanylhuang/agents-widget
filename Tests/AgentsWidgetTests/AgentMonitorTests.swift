@@ -65,7 +65,10 @@ final class AgentMonitorTests: XCTestCase {
             cwd: "/tmp/agents-widget",
             status: .running,
             startedAt: now.addingTimeInterval(-30),
-            lastActivityAt: now.addingTimeInterval(-10)
+            lastActivityAt: now.addingTimeInterval(-10),
+            statusEvidence: AgentStatusEvidence(
+                lastAssistantOrToolActivityAt: now.addingTimeInterval(-10)
+            )
         )
         let process = ProcessSnapshot(
             pid: 123,
@@ -100,7 +103,7 @@ final class AgentMonitorTests: XCTestCase {
         let merged = AgentMonitor.merge(processes: [process], sessions: [], now: now)
 
         XCTAssertEqual(merged.first?.title, "OpenCode PID 456")
-        XCTAssertEqual(merged.first?.status, .idle)
+        XCTAssertEqual(merged.first?.status, .unknown)
     }
 
     func testFinishedSessionWithLiveProcessIsIdle() {
@@ -154,7 +157,11 @@ final class AgentMonitorTests: XCTestCase {
             cwd: "/tmp/agents-widget",
             status: .error,
             startedAt: now.addingTimeInterval(-300),
-            lastActivityAt: now.addingTimeInterval(-10)
+            lastActivityAt: now.addingTimeInterval(-10),
+            statusEvidence: AgentStatusEvidence(
+                providerTerminalState: .error,
+                lastAssistantOrToolActivityAt: now.addingTimeInterval(-2)
+            )
         )
         let process = ProcessSnapshot(
             pid: 123,
@@ -173,7 +180,7 @@ final class AgentMonitorTests: XCTestCase {
         XCTAssertEqual(merged.first?.terminalTarget?.tty, "/dev/ttys000")
     }
 
-    func testLiveMatchedSessionIsRunningEvenWhenTranscriptIsOld() {
+    func testLiveMatchedSessionWithoutFreshEvidenceIsIdle() {
         let now = Date(timeIntervalSince1970: 1_000)
         let session = AgentSummary(
             id: "session-1",
@@ -195,7 +202,7 @@ final class AgentMonitorTests: XCTestCase {
 
         let merged = AgentMonitor.merge(processes: [process], sessions: [session], now: now)
 
-        XCTAssertEqual(merged.first?.status, .running)
+        XCTAssertEqual(merged.first?.status, .idle)
     }
 
     func testActiveProviderEvidenceWithLiveProcessIsRunning() {
@@ -207,7 +214,10 @@ final class AgentMonitorTests: XCTestCase {
             cwd: "/tmp/agents-widget",
             status: .running,
             startedAt: now.addingTimeInterval(-200),
-            lastActivityAt: now.addingTimeInterval(-10)
+            lastActivityAt: now.addingTimeInterval(-10),
+            statusEvidence: AgentStatusEvidence(
+                lastAssistantOrToolActivityAt: now.addingTimeInterval(-10)
+            )
         )
         let process = ProcessSnapshot(
             pid: 123,
@@ -283,40 +293,61 @@ final class AgentMonitorTests: XCTestCase {
     }
 
     @MainActor
-    func testMenuOpenRendersCachedStateWithoutRefreshOrWatchers() async throws {
+    func testMenuOpenRequestsBoundedRefreshWithThrottle() async throws {
         let processProvider = CountingMonitorProcessProvider()
         let codexStore = CountingMonitorCodexStore()
         let openCodeStore = CountingMonitorOpenCodeStore()
         let eventSource = ManualAgentEventSource()
+        let dateProvider = MutableDateProvider(date: Date(timeIntervalSince1970: 1_000))
         let monitor = AgentMonitor(
             processProvider: processProvider,
             codexStore: codexStore,
             openCodeStore: openCodeStore,
+            dateProvider: dateProvider,
             eventSource: eventSource,
             eventDebounceNanoseconds: 10_000_000,
-            menuTickIntervalNanoseconds: 10_000_000
+            menuTickIntervalNanoseconds: 10_000_000,
+            menuOpenRefreshThrottleInterval: 5,
+            menuCloseGraceNanoseconds: 100_000_000
         )
 
         monitor.start()
         monitor.setMenuVisible(true)
-        try await Task.sleep(for: .milliseconds(150))
+        try await waitForMainActorCondition(timeout: 1) {
+            processProvider.callCount == 1 && !monitor.isRefreshing
+        }
 
-        XCTAssertEqual(processProvider.callCount, 0)
-        XCTAssertEqual(codexStore.callCount, 0)
-        XCTAssertEqual(openCodeStore.callCount, 0)
-        XCTAssertEqual(eventSource.startCount, 0)
+        XCTAssertEqual(processProvider.callCount, 1)
+        XCTAssertEqual(codexStore.callCount, 1)
+        XCTAssertEqual(openCodeStore.callCount, 1)
+        XCTAssertEqual(eventSource.startCount, 1)
         XCTAssertEqual(eventSource.stopCount, 0)
-        XCTAssertNil(monitor.lastRefreshProfile)
+        XCTAssertEqual(monitor.lastRefreshProfile?.reason, .menuOpen)
 
         monitor.setMenuVisible(false)
         monitor.setMenuVisible(true)
-        try await Task.sleep(for: .milliseconds(150))
+        try await Task.sleep(for: .milliseconds(50))
 
-        XCTAssertEqual(processProvider.callCount, 0)
-        XCTAssertEqual(codexStore.callCount, 0)
-        XCTAssertEqual(openCodeStore.callCount, 0)
-        XCTAssertEqual(eventSource.startCount, 0)
+        XCTAssertEqual(processProvider.callCount, 1)
+        XCTAssertEqual(codexStore.callCount, 1)
+        XCTAssertEqual(openCodeStore.callCount, 1)
+        XCTAssertEqual(eventSource.startCount, 1)
         XCTAssertEqual(eventSource.stopCount, 0)
+
+        dateProvider.advance(by: 5.1)
+        monitor.setMenuVisible(false)
+        monitor.setMenuVisible(true)
+        try await waitForMainActorCondition(timeout: 1) {
+            processProvider.callCount == 2 && !monitor.isRefreshing
+        }
+
+        XCTAssertEqual(codexStore.callCount, 1)
+        XCTAssertEqual(openCodeStore.callCount, 1)
+        XCTAssertEqual(eventSource.startCount, 1)
+        XCTAssertEqual(monitor.lastRefreshProfile?.reason, .menuOpen)
+        monitor.setMenuVisible(false)
+        try await Task.sleep(for: .milliseconds(160))
+        XCTAssertEqual(eventSource.stopCount, 1)
         monitor.stop()
     }
 
@@ -335,7 +366,6 @@ final class AgentMonitorTests: XCTestCase {
 
         monitor.start()
         monitor.warmCache()
-
         try await waitForMainActorCondition(timeout: 1) {
             processProvider.callCount == 1 && !monitor.isRefreshing
         }
@@ -346,48 +376,6 @@ final class AgentMonitorTests: XCTestCase {
         XCTAssertEqual(eventSource.startCount, 0)
         XCTAssertEqual(eventSource.stopCount, 0)
         XCTAssertEqual(monitor.lastRefreshProfile?.reason, .startup)
-        monitor.stop()
-    }
-
-    @MainActor
-    func testRapidMenuReopenDoesNotStartRefreshWork() async throws {
-        let processProvider = CountingMonitorProcessProvider()
-        let codexStore = CountingMonitorCodexStore()
-        let openCodeStore = CountingMonitorOpenCodeStore()
-        let eventSource = ManualAgentEventSource()
-        let monitor = AgentMonitor(
-            processProvider: processProvider,
-            codexStore: codexStore,
-            openCodeStore: openCodeStore,
-            eventSource: eventSource,
-            eventDebounceNanoseconds: 10_000_000,
-            menuTickIntervalNanoseconds: 10_000_000,
-            menuCloseGraceNanoseconds: 100_000_000
-        )
-
-        monitor.start()
-        monitor.setMenuVisible(true)
-        try await Task.sleep(for: .milliseconds(50))
-
-        XCTAssertEqual(processProvider.callCount, 0)
-        XCTAssertEqual(codexStore.callCount, 0)
-        XCTAssertEqual(openCodeStore.callCount, 0)
-        XCTAssertEqual(eventSource.startCount, 0)
-        XCTAssertEqual(eventSource.stopCount, 0)
-
-        monitor.setMenuVisible(false)
-        monitor.setMenuVisible(true)
-        try await Task.sleep(for: .milliseconds(50))
-
-        XCTAssertEqual(eventSource.startCount, 0)
-        XCTAssertEqual(eventSource.stopCount, 0)
-        XCTAssertEqual(processProvider.callCount, 0)
-
-        monitor.setMenuVisible(false)
-        try await Task.sleep(for: .milliseconds(160))
-
-        XCTAssertEqual(eventSource.startCount, 0)
-        XCTAssertEqual(eventSource.stopCount, 0)
         monitor.stop()
     }
 
@@ -405,8 +393,8 @@ final class AgentMonitorTests: XCTestCase {
             eventDebounceNanoseconds: 10_000_000
         )
 
-        monitor.start()
         monitor.setMenuVisible(true)
+        monitor.start()
 
         monitor.handleEvent(.codexSessionsChanged)
         monitor.handleEvent(.openCodeDatabaseChanged)
@@ -422,6 +410,110 @@ final class AgentMonitorTests: XCTestCase {
         XCTAssertEqual(openCodeStore.callCount, 1)
         XCTAssertEqual(monitor.lastRefreshProfile?.reason, .providerDirty)
         monitor.stop()
+    }
+
+    func testActiveFilterReturnsOnlyTerminalBackedAgents() {
+        let active = AgentSummary(
+            id: "active",
+            provider: .codex,
+            title: "Active",
+            pid: 1,
+            tty: "/dev/ttys001",
+            terminalTarget: TerminalTarget(tty: "/dev/ttys001", pid: 1)
+        )
+        let historical = AgentSummary(id: "historical", provider: .opencode, title: "Historical")
+
+        XCTAssertEqual(AgentMonitor.filteredAgents([active, historical], filter: .activeTerminal).map(\.id), ["active"])
+        XCTAssertEqual(AgentMonitor.filteredAgents([active, historical], filter: .allTasks).map(\.id), ["active", "historical"])
+    }
+
+    func testAttentionReasonsAndBadgeCountRules() {
+        let stuck = AgentSummary(
+            id: "stuck",
+            provider: .codex,
+            title: "Stuck",
+            pid: 1,
+            tty: "/dev/ttys001",
+            status: .stuck,
+            terminalTarget: TerminalTarget(tty: "/dev/ttys001", pid: 1)
+        )
+        let error = AgentSummary(
+            id: "error",
+            provider: .codex,
+            title: "Error",
+            pid: 2,
+            tty: "/dev/ttys002",
+            status: .error,
+            terminalTarget: TerminalTarget(tty: "/dev/ttys002", pid: 2)
+        )
+        let inactiveError = AgentSummary(id: "inactive-error", provider: .codex, title: "Inactive Error", status: .error)
+        let idle = AgentSummary(
+            id: "idle",
+            provider: .opencode,
+            title: "Idle",
+            pid: 3,
+            tty: "/dev/ttys003",
+            status: .idle,
+            terminalTarget: TerminalTarget(tty: "/dev/ttys003", pid: 3),
+            statusEvidence: AgentStatusEvidence()
+        )
+
+        let withAttention = AgentMonitor.applyAttention(
+            to: [stuck, error, inactiveError, idle],
+            previousStatuses: [:],
+            previousTerminalBackedIDs: []
+        )
+
+        XCTAssertEqual(withAttention.first(where: { $0.id == "stuck" })?.attentionReasons, [.stuck])
+        XCTAssertEqual(withAttention.first(where: { $0.id == "error" })?.attentionReasons, [.error])
+        XCTAssertEqual(withAttention.first(where: { $0.id == "inactive-error" })?.attentionReasons, [])
+        XCTAssertEqual(withAttention.first(where: { $0.id == "idle" })?.attentionReasons, [.inputNeeded])
+        XCTAssertEqual(withAttention.filter(\.needsAttention).count, 3)
+    }
+
+    func testBadgeCountsOneAgentOnceWithMultipleAttentionReasons() {
+        let agent = AgentSummary(
+            id: "agent",
+            provider: .codex,
+            title: "Agent",
+            pid: 3,
+            tty: "/dev/ttys003",
+            status: .stuck,
+            terminalTarget: TerminalTarget(tty: "/dev/ttys003", pid: 3)
+        )
+
+        let withAttention = AgentMonitor.applyAttention(
+            to: [agent],
+            previousStatuses: [:],
+            previousTerminalBackedIDs: []
+        )
+
+        XCTAssertEqual(withAttention.first?.attentionReasons, [.stuck])
+        XCTAssertEqual(withAttention.filter(\.needsAttention).count, 1)
+    }
+
+    func testCompletedAttentionRequiresObservedTransitionOrPriorTerminalBacking() {
+        let complete = AgentSummary(id: "session", provider: .codex, title: "Done", status: .complete)
+
+        let historical = AgentMonitor.applyAttention(
+            to: [complete],
+            previousStatuses: [:],
+            previousTerminalBackedIDs: []
+        )
+        let transitioned = AgentMonitor.applyAttention(
+            to: [complete],
+            previousStatuses: ["session": .running],
+            previousTerminalBackedIDs: []
+        )
+        let previouslyTerminalBacked = AgentMonitor.applyAttention(
+            to: [complete],
+            previousStatuses: [:],
+            previousTerminalBackedIDs: ["session"]
+        )
+
+        XCTAssertEqual(historical.first?.attentionReasons, [])
+        XCTAssertEqual(transitioned.first?.attentionReasons, [.completed])
+        XCTAssertEqual(previouslyTerminalBacked.first?.attentionReasons, [.completed])
     }
 }
 
@@ -470,6 +562,27 @@ private struct EmptyCodexStore: CodexSessionStoring {
 private struct EmptyOpenCodeStore: OpenCodeSessionStoring {
     func summaries(now: Date) -> ProviderResult<[AgentSummary]> {
         ProviderResult(value: [])
+    }
+}
+
+private final class MutableDateProvider: DateProviding, @unchecked Sendable {
+    private let lock = NSLock()
+    private var date: Date
+
+    init(date: Date) {
+        self.date = date
+    }
+
+    func now() -> Date {
+        lock.lock()
+        defer { lock.unlock() }
+        return date
+    }
+
+    func advance(by interval: TimeInterval) {
+        lock.lock()
+        date = date.addingTimeInterval(interval)
+        lock.unlock()
     }
 }
 

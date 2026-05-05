@@ -1,9 +1,11 @@
-# M2 Architect Artifact - Focused Agent List, Attention Badge, Usage Summary
+# M2 Architect Artifact - Focused Agent List And Attention Badge
 
 ## Problem Restatement
-M2 refines the existing native macOS menu bar app after the M1 MVP. The app must default to showing only coding-agent tasks that are currently attached to open Terminal.app sessions, while still letting the user switch to all known recent tasks. The row UI must become cleaner: project folder name is the dominant title, Codex/OpenCode session title is clearly secondary, runtime and token usage are easier to scan, and row-level money, idle time, terminal location, active tool, and provider sparkle/code icons are removed.
+M2 refines the existing native macOS menu bar app after the M1 MVP and M1.5 energy work. The app must default to showing only coding-agent tasks that are currently attached to open Terminal.app sessions, while still letting the user switch to all known recent tasks. The row UI must become cleaner: project folder name is the dominant title, Codex/OpenCode session title is clearly secondary, runtime and token usage are easier to scan, and row-level money, idle time, terminal location, active tool, and provider sparkle/code icons are removed.
 
-M2 also introduces an attention concept. The menu bar item must show a small red count for tasks that need user attention, including likely input needed, stuck/error states, and newly completed tasks. A minimal footer summary must use local `ccusage` JSON output to show today's and this week's token and dollar consumption without making the per-agent rows about money.
+M2 also fixes the weak M1/M1.5 status model. The current implementation cannot reliably distinguish "the agent is actively working" from "the live agent is waiting for the user"; M2 must make `running` versus `idle` robust, explicit, test-covered, and cheap. Performance gains at the cost of wrong status are a failure condition.
+
+M2 also introduces an attention concept. The menu bar item must show a small red count for tasks that need user attention, including likely input needed, stuck/error states, and newly completed tasks.
 
 ---
 
@@ -14,28 +16,33 @@ M2 also introduces an attention concept. The menu bar item must show a small red
 4. The default view filter is Active. The user can switch to All in the menu window.
 5. The app continues to read all recent sessions internally so attention counts and the All filter work, but rows hidden by the Active filter are not shown by default.
 6. Historical completed sessions must not all create red badge counts. Completion attention is only for sessions observed transitioning from running/idle/stuck to complete while this app is running, or for sessions with a retained prior terminal association from this app session.
-7. `ccusage` is available locally at `/opt/homebrew/bin/ccusage` on the current machine. The implementation must still handle the command being missing.
-8. `ccusage --offline --json` must be used for the hot path so the app does not trigger network pricing fetches.
-9. Row-level provider-recorded `costUSD` may remain in the normalized model for parser compatibility, but it must not be displayed in agent rows.
-10. "Token cost" in the row means token consumption/count, not dollar price.
-11. No raw transcript text should be displayed. Session titles must stay truncated and sanitized as in M1.
+7. Row-level provider-recorded `costUSD` may remain in the normalized model for parser compatibility, but it must not be displayed in agent rows.
+8. "Token cost" in the row means token consumption/count, not dollar price.
+9. No raw transcript text should be displayed. Session titles must stay truncated and sanitized as in M1.
+10. M2 status semantics are authoritative and replace the M1.5 shortcut that treated any live matched process as `running`.
+11. `idle` means a live terminal-backed agent is not currently executing a model turn or tool call and is likely waiting for user input. Idle is an attention state, not a failure state.
+12. `running` means there is fresh local evidence of active model/tool work in progress. A live process alone is not enough to call a task `running`.
+13. `unknown` must be used when local evidence is insufficient. Do not silently coerce ambiguous process-only rows to `running` or `idle`.
+14. Robust status detection must preserve M1.5 energy constraints: no deep scans on menu open, no per-row process polling loops, no transcript rereads when append caches prove unchanged, and no external network calls.
 
 ---
 
 ## IN_SCOPE
 - `Sources/AgentsWidgetApp/AgentsWidgetApp.swift` - replace the static menu bar label with a custom label that can show a red attention count and start monitoring on launch, not only when the menu opens.
 - `Sources/AgentsWidgetCore/Models/AgentSummary.swift` - add attention metadata and display/filter support types while preserving the M1 fields needed by parsers and status derivation.
-- `Sources/AgentsWidgetCore/Models/UsageSummary.swift` - new local model for today/week `ccusage` totals.
-- `Sources/AgentsWidgetCore/Services/AgentMonitor.swift` - maintain all discovered agents, derive attention reasons, expose active/all filtered rows or filter helpers, track prior status/terminal-backed state for completion attention, and refresh usage summary on a slower cadence.
-- `Sources/AgentsWidgetCore/Services/CCUsageSummaryService.swift` - new read-only local service that invokes `ccusage` with `--json --offline`, parses daily/weekly totals, and returns diagnostics on missing/busy/invalid command output.
-- `Sources/AgentsWidgetCore/Support/ProcessRunner.swift` - move the existing internal `ProcessRunner`, `PipeDrain`, and `ProcessError` out of `ProcessSnapshotProvider.swift` so `CCUsageSummaryService` can reuse the same safe process execution path.
-- `Sources/AgentsWidgetCore/Support/Diagnostics.swift` - add `ccusage` diagnostics and remove UI dependency on `Diagnostics.costUnavailable` where no longer displayed.
-- `Sources/AgentsWidgetCore/Support/Formatters.swift` - add compact runtime, token, and usage-money formatters; keep existing formatter behavior where tests still require it.
+- `Sources/AgentsWidgetCore/Models/AgentStatusEvidence.swift` - new lightweight evidence model for status classification, or equivalent internal types if a separate file is not needed.
+- `Sources/AgentsWidgetCore/Services/AgentStatusClassifier.swift` - new pure classifier that owns the authoritative running/idle/stuck/complete/error/unknown decision tree.
+- `Sources/AgentsWidgetCore/Services/AgentMonitor.swift` - maintain all discovered agents, invoke the status classifier after provider/process merge, derive attention reasons, expose active/all filtered rows or filter helpers, and track prior status/terminal-backed state for completion attention.
+- `Sources/AgentsWidgetCore/Support/ProcessRunner.swift` - move the existing internal `ProcessRunner`, `PipeDrain`, and `ProcessError` out of `ProcessSnapshotProvider.swift` so process execution is shared safely.
+- `Sources/AgentsWidgetCore/Support/Diagnostics.swift` - keep local diagnostics clear and non-blocking.
+- `Sources/AgentsWidgetCore/Support/Formatters.swift` - add compact runtime and token formatters; keep existing formatter behavior where tests still require it.
 - `Sources/AgentsWidgetCore/Views/MenuBarStatusLabel.swift` - new menu bar label view with SF Symbol terminal mark and red count badge when attention count is greater than zero.
-- `Sources/AgentsWidgetCore/Views/MenuBarRootView.swift` - add Active/All segmented filter, display filtered rows, adjust status summary for attention, and add minimal bottom usage summary.
+- `Sources/AgentsWidgetCore/Views/MenuBarRootView.swift` - add Active/All segmented filter, display filtered rows, and adjust status summary for attention.
 - `Sources/AgentsWidgetCore/Views/AgentRowView.swift` - redesign each row around status dot, prominent project folder, secondary session title, runtime, and token usage only.
 - `Tests/AgentsWidgetTests/AgentMonitorTests.swift` - add filter and attention transition tests.
-- `Tests/AgentsWidgetTests/CCUsageSummaryServiceTests.swift` - add fixture-driven parser tests for daily array output, weekly object output, empty output, malformed output, and missing command diagnostics.
+- `Tests/AgentsWidgetTests/AgentStatusClassifierTests.swift` - add exhaustive status truth-table coverage for live process, provider state, active tool, fresh activity, stale activity, completion, error, and ambiguity cases.
+- `Tests/AgentsWidgetTests/CodexSessionStoreStatusEvidenceTests.swift` - add fixture-driven coverage for Codex evidence extraction used by running/idle classification.
+- `Tests/AgentsWidgetTests/OpenCodeSessionStoreStatusEvidenceTests.swift` - add fixture-driven coverage for OpenCode evidence extraction used by running/idle classification.
 - `Tests/AgentsWidgetTests/FormatterTests.swift` - add compact runtime/token/money formatter coverage used by M2.
 - `Tests/AgentsWidgetTests/MenuBarRootViewTests.swift` - add pure helper tests for filtered empty-state copy and attention summary copy.
 - `Tests/AgentsWidgetTests/AgentRowViewTests.swift` - add testable display-model coverage so row text excludes idle time, TTY, active tool, and USD.
@@ -49,7 +56,6 @@ M2 also introduces an attention concept. The menu bar item must show a small red
 - Adding support for iTerm2, Ghostty, Warp, VS Code integrated terminals, tmux pane selection, or non-Terminal focus behavior.
 - Displaying raw prompts, transcripts, full paths by default, command output, tool-call names, or terminal TTY values in rows.
 - Inferring per-agent dollar cost from token counts or model pricing tables.
-- Calling `ccusage` without `--offline`.
 - Adding third-party Swift dependencies.
 
 ---
@@ -59,24 +65,92 @@ M2 also introduces an attention concept. The menu bar item must show a small red
 ### Current Evidence
 Local inspection before this plan showed:
 
-- `M1_IMPLEMENTATION_PLAN.md` is the only existing milestone plan.
+- `docs/M1_IMPLEMENTATION_PLAN.md`, `docs/M1_5_ENERGY_OPTIMIZATION_IMPLEMENTATION_PLAN.md`, and `docs/M1_5_VERIFICATION.md` exist and must be treated as prior evidence.
+- `docs/M1_5_VERIFICATION.md` records the current M1.5 status shortcut: a live process matched to a non-complete session becomes `running`, an unmatched live process becomes `idle`, and stale local complete/error is overridden by live process evidence.
+- The M1.5 shortcut fixed false `error`/false `idle` regressions, but it is not precise enough for M2 because it cannot prove whether a live matched agent is actively working or waiting for user input.
 - `AgentRowView` currently renders a status dot plus provider SF Symbol, including `sparkles` for Codex.
 - `AgentRowView.metadataLine` currently includes project basename, runtime, idle time, and TTY.
 - `AgentRowView.metricsLine` currently includes tokens, row-level USD, and active tool.
-- `MenuBarRootView` currently renders all `monitor.agents` with no Active/All filter and no usage summary.
+- `MenuBarRootView` currently renders all `monitor.agents` with no Active/All filter.
 - `AgentsWidgetApp` currently uses `MenuBarExtra("Agents Widget", systemImage: "terminal")`, so it cannot display a dynamic red count badge.
-- `ccusage` exists locally at `/opt/homebrew/bin/ccusage`.
-- `ccusage weekly --json --offline --since 20260504 --until 20260504` returned an object with `weekly` and `totals`; `totals` included `inputTokens`, `outputTokens`, `cacheCreationTokens`, `cacheReadTokens`, `totalTokens`, and `totalCost`.
-- `ccusage daily --json --offline --since 20260504 --until 20260504` returned `[]` on the current machine, so the daily parser must accept empty arrays.
 
 ### Data Flow
-1. `AgentMonitor` refreshes providers as in M1 and stores the full merged list as the source of truth.
-2. `AgentMonitor` compares the new full list to the previous full list and derives attention reasons.
-3. `MenuBarStatusLabel` observes the monitor's attention count and renders the red count in the menu bar item.
-4. `MenuBarRootView` defaults to `.activeTerminal` and filters rows at render time.
-5. The user can switch to `.allTasks` to see all recent Codex/OpenCode sessions discovered by the M1 providers.
-6. `CCUsageSummaryService` refreshes on launch, manual refresh, and then at a slower interval than agent polling.
-7. The footer renders a compact usage line from `UsageSummary`; failures are diagnostics, not blocking errors.
+1. Codex/OpenCode stores parse bounded local session deltas and emit `AgentSummary` plus status evidence. They do not infer final status alone except for explicit provider complete/error facts.
+2. `ProcessSnapshotProvider` emits cached live process/TTY facts from the existing bounded process snapshot path.
+3. `AgentMonitor` merges provider rows with live processes.
+4. `AgentStatusClassifier` receives the merged row plus evidence and produces the authoritative status.
+5. `AgentMonitor` compares the new full list to the previous full list and derives attention reasons.
+6. `MenuBarStatusLabel` observes the monitor's attention count and renders the red count in the menu bar item.
+7. `MenuBarRootView` defaults to `.activeTerminal` and filters rows at render time.
+8. The user can switch to `.allTasks` to see all recent Codex/OpenCode sessions discovered by the M1 providers.
+
+### Authoritative Status Contract
+M2 must make the status meanings unambiguous:
+
+- `running`: the agent is actively working. Acceptable evidence is an incomplete non-stale tool call, an open/non-final provider turn, fresh assistant/tool transcript activity, or another explicit provider-local "busy/working" signal.
+- `idle`: a live terminal-backed agent has no open tool/model turn, no fresh assistant/tool activity, and no terminal provider final state. This means the agent is likely waiting for user input.
+- `stuck`: the agent has an open tool/model turn that has not produced provider-local progress for longer than the stale threshold.
+- `complete`: provider-local evidence says the task/session completed and there is no newer live active work for that same session.
+- `error`: provider-local evidence says the task/session errored and there is no newer live active work for that same session.
+- `unknown`: local evidence is insufficient or contradictory.
+
+Hard rules:
+
+- A live process is a prerequisite for `running`, `idle`, and `stuck`, but it is not sufficient evidence for `running`.
+- A process-only row with no matched session/evidence must be `unknown`, not `idle`.
+- A stale transcript timestamp alone must not make a live active turn `idle`; open activity state takes precedence.
+- A stale provider `error` or `complete` must not override newer live activity evidence.
+- `idle` is the status used for "needs user input"; the badge/attention system is what makes that actionable.
+- Provider parser failures must degrade to `unknown` plus diagnostics, never fabricated `running`/`idle`.
+
+### Bulletproof Running vs Idle Plan
+Implement status derivation as a pure, testable classifier with a documented truth table. Do not keep the current inline `AgentMonitor.status(for:hasProcess:hasSession:now:)` as the source of truth.
+
+Evidence inputs:
+
+- `hasLiveProcess`: from the cached process snapshot merged into the row.
+- `isTerminalBacked`: `terminalTarget != nil || (pid != nil && tty != nil)`.
+- `providerTerminalState`: explicit provider-local `.complete`, `.error`, `.running`, or `.unknown` facts from transcript/DB records.
+- `openActivityKind`: `.modelTurn`, `.toolCall`, or `.none`.
+- `openActivityStartedAt`: when the current open activity began, if known.
+- `openActivityUpdatedAt`: newest provider-local progress timestamp for the open activity, if known.
+- `lastAssistantOrToolActivityAt`: newest provider-local assistant/tool output timestamp, excluding user input-only writes when the provider format exposes role/type.
+- `lastUserInputAt`: newest user input timestamp, if available.
+- `evidenceObservedAt`: file modification time, DB row update time, or parser observation time used to make freshness decisions explicit.
+
+Freshness thresholds:
+
+- `freshActivityWindowSeconds = 30`: recent assistant/tool progress keeps a live row `running`.
+- `staleOpenActivitySeconds = 90`: open tool/model activity with no provider-local progress becomes `stuck`.
+- `idleGraceSeconds = 5`: immediately after a user input or process/session birth, keep ambiguous live rows `unknown` briefly rather than flipping straight to `idle`.
+
+Decision order:
+
+1. If there is no live process: return explicit provider `.error`, explicit provider `.complete`, otherwise `.unknown`.
+2. If there is a live process and an open tool/model activity:
+   - if `now - openActivityUpdatedAt` or `now - openActivityStartedAt` is at least `staleOpenActivitySeconds`, return `.stuck`;
+   - otherwise return `.running`.
+3. If there is a live process and fresh assistant/tool activity within `freshActivityWindowSeconds`, return `.running`.
+4. If there is a live process and explicit provider `.error`/`.complete` is older than newer process/session activity, ignore the stale final state and continue classification.
+5. If there is a live terminal-backed matched session, no open activity, no fresh assistant/tool activity, and the row is outside `idleGraceSeconds`, return `.idle`.
+6. If there is a live process but no matched session/evidence, return `.unknown`.
+7. Otherwise return `.unknown`.
+
+Provider extraction requirements:
+
+- Codex parser must distinguish user messages from assistant/tool messages when local JSONL fields make that possible.
+- Codex parser must retain incomplete tool calls and any explicit open-turn/event evidence already present in JSONL.
+- OpenCode parser must distinguish DB session update time from assistant/tool progress time where message/part rows make that possible.
+- OpenCode parser must retain incomplete tool calls and explicit session/share/finish/error state without treating a live process as automatic `running`.
+- If provider formats do not expose an explicit open model turn, use fresh assistant/tool output plus active tool state; do not invent an open turn.
+
+Performance requirements:
+
+- Status classification must be O(number of merged rows) over already-parsed summaries.
+- Provider evidence must come from the existing cached/append-window parsing paths; menu open must not trigger deep transcript reads.
+- Process CPU sampling is out of scope unless it is available from the same cached `ps` snapshot at no extra process invocation.
+- No continuous polling loop may be added solely for status precision. Existing refresh/event paths may update status using cached state.
+- Manual refresh may do deeper local reads, but normal menu activation must remain cached presentation only.
 
 ### Model Additions
 Add these M2 types in `AgentSummary.swift` unless a separate small model file is cleaner:
@@ -93,12 +167,35 @@ public enum AgentAttentionReason: String, Codable, CaseIterable, Sendable {
     case error
     case completed
 }
+
+public enum AgentOpenActivityKind: String, Codable, Sendable {
+    case modelTurn
+    case toolCall
+}
+
+public enum ProviderTerminalState: String, Codable, Sendable {
+    case running
+    case complete
+    case error
+    case unknown
+}
+
+public struct AgentStatusEvidence: Codable, Equatable, Sendable {
+    public var providerTerminalState: ProviderTerminalState
+    public var openActivityKind: AgentOpenActivityKind?
+    public var openActivityStartedAt: Date?
+    public var openActivityUpdatedAt: Date?
+    public var lastAssistantOrToolActivityAt: Date?
+    public var lastUserInputAt: Date?
+    public var evidenceObservedAt: Date?
+}
 ```
 
 Extend `AgentSummary`:
 
 ```swift
 public var attentionReasons: [AgentAttentionReason]
+public var statusEvidence: AgentStatusEvidence?
 
 public var isTerminalBacked: Bool {
     terminalTarget != nil || (pid != nil && tty != nil)
@@ -111,33 +208,17 @@ public var needsAttention: Bool {
 
 Do not remove M1 fields from the model in M2. `idleSeconds`, `activeTool`, and `costUSD` may still be used internally for status/attention/parser compatibility, but `AgentRowView` must stop displaying them.
 
-Create `UsageSummary.swift`:
-
-```swift
-public struct UsagePeriodSummary: Codable, Equatable, Sendable {
-    public var totalTokens: Int
-    public var totalCostUSD: Decimal
-}
-
-public struct UsageSummary: Codable, Equatable, Sendable {
-    public var today: UsagePeriodSummary
-    public var week: UsagePeriodSummary
-    public var refreshedAt: Date?
-    public var diagnostics: [String]
-}
-```
-
 ### Attention Rules
-Apply attention reasons after `AgentMonitor.merge` has derived status.
+Apply attention reasons after `AgentStatusClassifier` has produced final status.
 
-1. `stuck`: current status is `.stuck`.
-2. `error`: current status is `.error`.
+1. `stuck`: current status is `.stuck` and the row is currently terminal-backed.
+2. `error`: current status is `.error` and the row is currently terminal-backed.
 3. `completed`: current status is `.complete` and the previous refresh saw the same id as `.running`, `.idle`, or `.stuck`, or the previous refresh had the same id as terminal-backed.
-4. `inputNeeded`: current row is terminal-backed, status is `.idle`, and there is no incomplete active tool. This is intentionally conservative and should not rely on visible idle time in the row.
+4. `inputNeeded`: current row is terminal-backed, status is `.idle`, and there is no open activity in `AgentStatusEvidence`. This is intentionally conservative and must not rely on visible idle duration in the row.
 
-Badge count is the number of unique agents with at least one attention reason. If one task is both `stuck` and `inputNeeded`, it counts once.
+Badge count is the number of unique active agents with at least one attention reason, plus newly completed tasks observed from a previous active state. Inactive historical error rows do not count. If one task is both `stuck` and `inputNeeded`, it counts once.
 
-Sort visible rows with attention first, then existing M1 status order, then newest activity descending.
+Sort visible rows with attention first, then status order `stuck`, `running`, `idle`, `error`, `complete`, `unknown`, then newest activity descending.
 
 ### Active/All Filter
 Add `AgentListFilter.activeTerminal` and `AgentListFilter.allTasks`.
@@ -229,56 +310,12 @@ MenuBarExtra {
 
 Do not implement Notification Center. This badge is the M2 notification concept.
 
-### Usage Summary
-Add `CCUsageSummaryService`:
-
-```swift
-public protocol UsageSummaryProviding: Sendable {
-    func summary(now: Date) -> ProviderResult<UsageSummary>
-}
-```
-
-Command policy:
-
-- Find `ccusage` using `/usr/bin/which ccusage` or known executable paths, preferring `/opt/homebrew/bin/ccusage` when it exists.
-- Run without a shell through `ProcessRunner`.
-- Always include `--json` and `--offline`.
-- Include `--timezone` using `TimeZone.current.identifier` when available.
-- For today: `ccusage daily --json --offline --since YYYYMMDD --until YYYYMMDD --timezone <tz>`.
-- For current week: `ccusage weekly --json --offline --since YYYYMMDD --until YYYYMMDD --timezone <tz>`.
-- Use `Calendar.current` to compute today, week start, and week end.
-- Refresh no more often than every 5 minutes unless the user clicks the refresh button.
-
-Parser requirements:
-
-- Daily output may be an array. Empty array means zero totals.
-- Weekly output may be an object with `weekly` and `totals`.
-- Accept both `totalCost` and `totalCostUSD` keys.
-- Accept total token fields directly when present; otherwise sum `inputTokens`, `outputTokens`, `cacheCreationTokens`, and `cacheReadTokens`.
-- Invalid JSON returns a `Diagnostics.ccusage(...)` diagnostic and zero totals.
-- Missing command returns a `Diagnostics.ccusage("ccusage unavailable")` diagnostic and zero totals.
-
-Footer UI:
-
-```text
-Today 0 tok / $0.00      Week 0 tok / $0.00
-```
-
-Keep the usage summary visually subordinate to rows:
-
-- Caption or caption2 typography.
-- Secondary foreground style.
-- One line where width allows.
-- No card container.
-- No model breakdown, chart, or per-project breakdown in M2.
-
 ### Formatting
 Add or reuse pure formatters:
 
 ```swift
 formatCompactDuration(_:) -> String      // "14m", "2h 14m", "3d 02h"
 formatCompactTokenCount(_:) -> String    // "834 tok", "832.6k tok", "1.2M tok"
-formatUsageCostUSD(_:) -> String         // "$0.00", "$3.12"
 formatProjectTitle(_:) -> String         // cwd basename, "Unknown project"
 formatSessionSubtitle(provider:title:) -> String
 ```
@@ -296,28 +333,37 @@ Keep `formatCostUSD(_:)` if tests or parser diagnostics still use it, but remove
 - Extend `SmokeReport` with:
   - `attentionCount`
   - `visibleActiveCount`
-  - `usageSummaryAvailable`
 - Remove `activeTool` and `hasCost` from smoke row output unless needed for parser smoke debugging.
 
 ### `Sources/AgentsWidgetCore/Models/AgentSummary.swift`
 - Add `AgentListFilter`.
 - Add `AgentAttentionReason`.
+- Add `AgentStatusEvidence`, `AgentOpenActivityKind`, and `ProviderTerminalState`, or keep them in `AgentStatusEvidence.swift` if a separate model file is clearer.
 - Add `attentionReasons` to `AgentSummary` initializer with default `[]`.
+- Add `statusEvidence` to `AgentSummary` initializer with default `nil`.
 - Add `isTerminalBacked` and `needsAttention`.
-- Ensure `refreshedDynamicFields(now:)` preserves attention reasons.
+- Ensure `refreshedDynamicFields(now:)` preserves attention reasons and status evidence.
 
-### `Sources/AgentsWidgetCore/Models/UsageSummary.swift`
-- Add `UsagePeriodSummary`.
-- Add `UsageSummary`.
-- Add `static let zero` convenience only if tests need it.
+### `Sources/AgentsWidgetCore/Services/AgentStatusClassifier.swift`
+- Implement a pure `AgentStatusClassifier` with injectable thresholds:
+  - `freshActivityWindowSeconds`
+  - `staleOpenActivitySeconds`
+  - `idleGraceSeconds`
+- Expose one pure function equivalent to:
+
+```swift
+struct AgentStatusClassifier {
+    func classify(_ agent: AgentSummary, hasLiveProcess: Bool, hasMatchedSession: Bool, now: Date) -> AgentStatus
+}
+```
+
+- Keep all status precedence in this file. Do not duplicate partial status rules in provider stores or views.
+- Treat `activeTool` as backward-compatible evidence by translating incomplete tools into `AgentStatusEvidence.openActivityKind == .toolCall` when providers have not populated the new evidence field.
+- Return `.unknown` for contradictory evidence and include a diagnostic if the contradiction is parser-visible.
 
 ### `Sources/AgentsWidgetCore/Services/AgentMonitor.swift`
 - Add published properties:
-  - `@Published public private(set) var usageSummary: UsageSummary = .zero`
   - `@Published public private(set) var attentionCount: Int = 0`
-- Add dependency:
-  - `usageSummaryProvider: any UsageSummaryProviding`
-- Update `live()` to use `CCUsageSummaryService()`.
 - Track previous state:
   - `previousStatusesByID: [String: AgentStatus]`
   - `previousTerminalBackedIDs: Set<String>`
@@ -325,32 +371,32 @@ Keep `formatCostUSD(_:)` if tests or parser diagnostics still use it, but remove
   - `filteredAgents(_ agents: [AgentSummary], filter: AgentListFilter) -> [AgentSummary]`
   - `applyAttention(to agents:previousStatuses:previousTerminalBackedIDs:) -> [AgentSummary]`
   - `attentionReasons(for:previousStatus:wasTerminalBacked:) -> [AgentAttentionReason]`
+- Replace calls to the current inline `status(for:hasProcess:hasSession:now:)` with `AgentStatusClassifier`.
+- Remove or demote the inline `status(for:hasProcess:hasSession:now:)` helper so there is exactly one status decision path.
+- Preserve M1.5 live-process precedence over stale complete/error, but only when newer live activity evidence exists.
 - Keep provider merging logic local-only and read-only.
-- Refresh usage summary:
-  - on first refresh,
-  - on forced refresh,
-  - when cached usage summary is older than 5 minutes.
 
-### `Sources/AgentsWidgetCore/Services/CCUsageSummaryService.swift`
-- Implement `UsageSummaryProviding`.
-- Use `ProcessRunner.run(...)`, never shell interpolation.
-- Add injectable executable URL and process-running closure for tests.
-- Parse daily and weekly JSON in pure functions.
-- Return zero usage plus diagnostics on command failure.
+### `Sources/AgentsWidgetCore/Services/CodexSessionStore.swift`
+- Populate `AgentStatusEvidence` from the same bounded JSONL parsing already used for summary metadata.
+- Track the newest non-user assistant/tool activity timestamp separately from file modification time.
+- Track newest user input timestamp separately so a just-submitted prompt can remain `unknown` during `idleGraceSeconds`.
+- Convert incomplete Codex tool/function-call state into `openActivityKind == .toolCall` with started/updated timestamps.
+- Convert explicit Codex completion/error events into `providerTerminalState`.
+- Do not classify a live Codex session as `running` only because the process exists.
+- Preserve append-window cache behavior; unchanged large JSONL files must not be reread for status evidence.
+
+### `Sources/AgentsWidgetCore/Services/OpenCodeSessionStore.swift`
+- Populate `AgentStatusEvidence` from the same SQLite reads already used for session metadata.
+- Distinguish session `updatedAt` from assistant/tool progress when message/part rows expose role/type/status.
+- Convert incomplete OpenCode tool parts into `openActivityKind == .toolCall` with started/updated timestamps.
+- Convert explicit OpenCode finish/error state into `providerTerminalState`.
+- Do not classify a live OpenCode session as `running` only because the process exists.
+- Keep SQLite query count bounded; M2 status evidence must not add an unbounded per-session query loop.
 
 ### `Sources/AgentsWidgetCore/Support/ProcessRunner.swift`
 - Move `ProcessRunner`, `PipeDrain`, and `ProcessError` here.
 - Leave behavior unchanged from M1.
 - Remove duplicate definitions from `ProcessSnapshotProvider.swift`.
-
-### `Sources/AgentsWidgetCore/Support/Diagnostics.swift`
-- Add:
-
-```swift
-public static func ccusage(_ message: String) -> String {
-    "ccusage: \(message)"
-}
-```
 
 ### `Sources/AgentsWidgetCore/Support/Formatters.swift`
 - Add M2 compact formatters.
@@ -370,7 +416,6 @@ public static func ccusage(_ message: String) -> String {
   - otherwise `3 active`
   - otherwise `Idle`
 - Use filter-specific empty-state title.
-- Add minimal usage summary above the footer controls or integrated into the footer.
 - Keep refresh and quit controls.
 
 ### `Sources/AgentsWidgetCore/Views/AgentRowView.swift`
@@ -391,6 +436,15 @@ public static func ccusage(_ message: String) -> String {
 - Add tests before broad UI wiring where possible.
 - Keep tests fixture-driven and avoid reading real private session data.
 - Required new/updated tests:
+  - Status truth table proves live matched process alone is not `running`.
+  - Status truth table proves process-only unmatched rows are `unknown`.
+  - Status truth table proves fresh assistant/tool activity with a live process is `running`.
+  - Status truth table proves live terminal-backed matched session with no open/fresh activity is `idle`.
+  - Status truth table proves idle terminal-backed means input-needed attention.
+  - Status truth table proves incomplete fresh tool is `running`.
+  - Status truth table proves stale incomplete tool is `stuck`.
+  - Status truth table proves stale provider `error` does not override newer live activity.
+  - Status truth table proves explicit complete/error without live process stays complete/error.
   - Active filter returns only terminal-backed agents.
   - All filter returns terminal-backed and historical sessions.
   - Badge count counts one agent once even with multiple reasons.
@@ -399,9 +453,10 @@ public static func ccusage(_ message: String) -> String {
   - Completed agent only produces attention on observed transition or prior terminal-backed state.
   - Historical complete agent with no previous state does not produce attention.
   - Row display model excludes TTY, idle time, active tool, and USD.
-  - `ccusage` parser handles empty daily array and weekly totals object.
-  - Missing `ccusage` produces diagnostics and zero usage.
-
+  - Codex fixture where last event is user input and no open activity classifies as `idle`.
+  - Codex fixture with fresh assistant/tool output classifies as `running`.
+  - OpenCode fixture where last event is user input and no open activity classifies as `idle`.
+  - OpenCode fixture with fresh assistant/tool output classifies as `running`.
 ---
 
 ## VERIFICATION / SUCCESS CRITERIA
@@ -413,11 +468,6 @@ Run these before implementation:
 pwd
 swift --version
 xcodebuild -version
-which ccusage
-ccusage daily --help
-ccusage weekly --help
-ccusage daily --json --offline --since 20260504 --until 20260504
-ccusage weekly --json --offline --since 20260504 --until 20260504
 ```
 
 Run these after implementation:
@@ -427,6 +477,7 @@ swift test
 swift build -c debug --product agents-widget
 scripts/build-app.sh
 build/Agents\ Widget.app/Contents/MacOS/agents-widget --smoke-json
+build/Agents\ Widget.app/Contents/MacOS/agents-widget --profile-refresh
 scripts/run-app.sh
 ```
 
@@ -438,7 +489,11 @@ scripts/run-app.sh
   - nonzero `mergedAgentCount` when local sessions exist,
   - `visibleActiveCount` equal to terminal-backed rows only,
   - `attentionCount`,
-  - usage summary fields or clear `ccusage` diagnostics.
+  - per-row `status` values produced by `AgentStatusClassifier`,
+  - status-evidence diagnostics when evidence is missing or contradictory.
+- Status classifier tests cover every row in the decision order truth table.
+- Parser fixture tests prove user-input-only terminal-backed sessions classify as `idle`, fresh assistant/tool activity classifies as `running`, stale open activity classifies as `stuck`, and ambiguous process-only rows classify as `unknown`.
+- Warm `--profile-refresh` remains within the M1.5 bounded-refresh profile: no process syscalls, file parses, or bytes read when caches are warm and no provider data changed.
 
 ### Manual Smoke Criteria
 - App launches as a menu bar app with no Dock icon.
@@ -450,12 +505,14 @@ scripts/run-app.sh
 - Rows show project folder as the most prominent text.
 - Rows show Codex/OpenCode session title as a smaller, clearly distinct subtitle.
 - Rows show runtime and token usage prominently.
+- Rows distinguish `running` from `idle` correctly for at least one real or fixture-backed active agent:
+  - active model/tool work shows `running`;
+  - waiting-for-user-input shows `idle` and increments attention.
+- A live process with no matched session/evidence does not show `running`; it shows `unknown`.
 - Rows do not show idle time, TTY, active tool, provider icon, sparkle icon, or row-level USD.
-- Bottom usage summary is present, one-line/minimal, and shows today/week tokens and dollars from `ccusage` or a clear non-fatal diagnostic.
 - Clicking a terminal-backed row still attempts Terminal.app focus as in M1.
 
 ### Known Limitations To Preserve In Handoff
 - `inputNeeded` is heuristic unless Codex/OpenCode expose explicit waiting-for-input state in local records.
-- `ccusage` measures Claude Code usage, not necessarily Codex/OpenCode usage, unless the local `ccusage` data source includes those tools.
 - Completed-task badge state is app-session-local in M2 and may reset on app restart.
 - Active filter depends on process/TTY evidence; rows can move to All if the CLI exits and no terminal target is retained.

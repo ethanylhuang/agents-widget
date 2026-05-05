@@ -23,6 +23,58 @@ public enum AgentStatus: String, Codable, CaseIterable, Sendable {
     case unknown
 }
 
+public enum AgentListFilter: String, Codable, CaseIterable, Sendable {
+    case activeTerminal
+    case allTasks
+}
+
+public enum AgentAttentionReason: String, Codable, CaseIterable, Sendable {
+    case inputNeeded
+    case stuck
+    case error
+    case completed
+}
+
+public enum AgentOpenActivityKind: String, Codable, Sendable {
+    case modelTurn
+    case toolCall
+}
+
+public enum ProviderTerminalState: String, Codable, Sendable {
+    case running
+    case complete
+    case error
+    case unknown
+}
+
+public struct AgentStatusEvidence: Codable, Equatable, Sendable {
+    public var providerTerminalState: ProviderTerminalState
+    public var openActivityKind: AgentOpenActivityKind?
+    public var openActivityStartedAt: Date?
+    public var openActivityUpdatedAt: Date?
+    public var lastAssistantOrToolActivityAt: Date?
+    public var lastUserInputAt: Date?
+    public var evidenceObservedAt: Date?
+
+    public init(
+        providerTerminalState: ProviderTerminalState = .unknown,
+        openActivityKind: AgentOpenActivityKind? = nil,
+        openActivityStartedAt: Date? = nil,
+        openActivityUpdatedAt: Date? = nil,
+        lastAssistantOrToolActivityAt: Date? = nil,
+        lastUserInputAt: Date? = nil,
+        evidenceObservedAt: Date? = nil
+    ) {
+        self.providerTerminalState = providerTerminalState
+        self.openActivityKind = openActivityKind
+        self.openActivityStartedAt = openActivityStartedAt
+        self.openActivityUpdatedAt = openActivityUpdatedAt
+        self.lastAssistantOrToolActivityAt = lastAssistantOrToolActivityAt
+        self.lastUserInputAt = lastUserInputAt
+        self.evidenceObservedAt = evidenceObservedAt
+    }
+}
+
 public struct TokenUsage: Codable, Equatable, Sendable {
     public var inputTokens: Int?
     public var cachedInputTokens: Int?
@@ -102,6 +154,8 @@ public struct AgentSummary: Identifiable, Codable, Equatable, Sendable {
     public var costUSD: Decimal?
     public var activeTool: ToolCallSummary?
     public var terminalTarget: TerminalTarget?
+    public var attentionReasons: [AgentAttentionReason]
+    public var statusEvidence: AgentStatusEvidence?
     public var diagnostics: [String]
 
     public init(
@@ -120,6 +174,8 @@ public struct AgentSummary: Identifiable, Codable, Equatable, Sendable {
         costUSD: Decimal? = nil,
         activeTool: ToolCallSummary? = nil,
         terminalTarget: TerminalTarget? = nil,
+        attentionReasons: [AgentAttentionReason] = [],
+        statusEvidence: AgentStatusEvidence? = nil,
         diagnostics: [String] = []
     ) {
         self.id = id
@@ -137,11 +193,21 @@ public struct AgentSummary: Identifiable, Codable, Equatable, Sendable {
         self.costUSD = costUSD
         self.activeTool = activeTool
         self.terminalTarget = terminalTarget
+        self.attentionReasons = attentionReasons
+        self.statusEvidence = statusEvidence
         self.diagnostics = diagnostics
     }
 
     public var isActionableTerminalJump: Bool {
         terminalTarget != nil
+    }
+
+    public var isTerminalBacked: Bool {
+        terminalTarget != nil || (pid != nil && tty != nil)
+    }
+
+    public var needsAttention: Bool {
+        !attentionReasons.isEmpty
     }
 }
 

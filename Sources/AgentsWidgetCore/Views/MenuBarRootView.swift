@@ -1,4 +1,3 @@
-import AppKit
 import SwiftUI
 
 public struct MenuBarRootView: View {
@@ -7,6 +6,7 @@ public struct MenuBarRootView: View {
     @ObservedObject private var monitor: AgentMonitor
     private let terminalJumpService: any TerminalJumping
     @State private var jumpDiagnostic: String?
+    @State private var selectedFilter: AgentListFilter = .activeTerminal
 
     public init(monitor: AgentMonitor, terminalJumpService: any TerminalJumping = TerminalJumpService()) {
         self.monitor = monitor
@@ -22,11 +22,10 @@ public struct MenuBarRootView: View {
                 Divider()
             }
             content
-            Divider()
-            footer
         }
         .frame(width: 360)
         .frame(maxHeight: 520)
+        .fixedSize(horizontal: false, vertical: true)
         .onAppear {
             monitor.setMenuVisible(true)
         }
@@ -36,47 +35,50 @@ public struct MenuBarRootView: View {
     }
 
     private var header: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "terminal")
-                .font(.system(size: 15, weight: .semibold))
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Agents")
-                    .font(.headline)
-                Text(statusSummary)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Image(systemName: "terminal")
+                    .font(.system(size: 15, weight: .semibold))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Agents")
+                        .font(.headline)
+                    Text(statusSummary)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
             }
-            Spacer()
-            Button {
-                monitor.requestRefresh(force: true)
-            } label: {
-                Image(systemName: "arrow.clockwise")
-                    .frame(width: 24, height: 24)
+
+            Picker("Filter", selection: $selectedFilter) {
+                Text("Active").tag(AgentListFilter.activeTerminal)
+                Text("All").tag(AgentListFilter.allTasks)
             }
-            .buttonStyle(.borderless)
-            .help("Refresh")
+            .pickerStyle(.segmented)
+            .labelsHidden()
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
     }
 
     private var content: some View {
-        Group {
-            if monitor.agents.isEmpty {
+        let visibleAgents = AgentMonitor.filteredAgents(monitor.agents, filter: selectedFilter)
+        return Group {
+            if visibleAgents.isEmpty {
                 VStack(spacing: 6) {
-                    Text(Self.emptyStateTitle(isRefreshing: monitor.isRefreshing, lastRefreshAt: monitor.lastRefreshAt))
+                    Text(Self.emptyStateTitle(
+                        filter: selectedFilter,
+                        isRefreshing: monitor.isRefreshing,
+                        lastRefreshAt: monitor.lastRefreshAt
+                    ))
                         .font(.subheadline)
                         .foregroundStyle(.primary)
-                    Text(AgentFormatters.formatLastRefresh(monitor.lastRefreshAt))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
                 }
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 28)
             } else {
                 ScrollView {
                     LazyVStack(spacing: 0) {
-                        ForEach(Array(monitor.agents.prefix(Self.visibleAgentLimit))) { agent in
+                        ForEach(Array(visibleAgents.prefix(Self.visibleAgentLimit))) { agent in
                             AgentRowView(agent: agent) {
                                 Task {
                                     let result = await terminalJumpService.jump(to: agent.terminalTarget)
@@ -85,8 +87,8 @@ public struct MenuBarRootView: View {
                             }
                             Divider()
                         }
-                        if monitor.agents.count > Self.visibleAgentLimit {
-                            Text("\(monitor.agents.count - Self.visibleAgentLimit) more agents")
+                        if visibleAgents.count > Self.visibleAgentLimit {
+                            Text("\(visibleAgents.count - Self.visibleAgentLimit) more agents")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -100,9 +102,16 @@ public struct MenuBarRootView: View {
         }
     }
 
-    nonisolated static func emptyStateTitle(isRefreshing: Bool, lastRefreshAt: Date?) -> String {
+    nonisolated static func emptyStateTitle(
+        filter: AgentListFilter = .allTasks,
+        isRefreshing: Bool,
+        lastRefreshAt: Date?
+    ) -> String {
         if isRefreshing && lastRefreshAt == nil {
             return "Refreshing..."
+        }
+        if filter == .activeTerminal {
+            return "No open Terminal agents"
         }
         return "No local agents found"
     }
@@ -128,33 +137,19 @@ public struct MenuBarRootView: View {
             .lineLimit(2)
     }
 
-    private var footer: some View {
-        HStack {
-            Text(AgentFormatters.formatLastRefresh(monitor.lastRefreshAt))
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Spacer()
-            Button("Quit") {
-                NSApplication.shared.terminate(nil)
-            }
-            .buttonStyle(.borderless)
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 9)
+    private var statusSummary: String {
+        Self.statusSummary(
+            attentionCount: monitor.attentionCount,
+            activeCount: AgentMonitor.filteredAgents(monitor.agents, filter: .activeTerminal).count
+        )
     }
 
-    private var statusSummary: String {
-        let stuck = monitor.agents.filter { $0.status == .stuck }.count
-        if stuck > 0 {
-            return "\(stuck) stuck"
+    nonisolated static func statusSummary(attentionCount: Int, activeCount: Int) -> String {
+        if attentionCount > 0 {
+            return "\(attentionCount) need attention"
         }
-        let running = monitor.agents.filter { $0.status == .running }.count
-        if running > 0 {
-            return "\(running) running"
-        }
-        let idle = monitor.agents.filter { $0.status == .idle }.count
-        if idle > 0 {
-            return "\(idle) idle"
+        if activeCount > 0 {
+            return "\(activeCount) active"
         }
         return "Idle"
     }

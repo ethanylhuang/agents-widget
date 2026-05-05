@@ -401,6 +401,7 @@ struct CodexSessionParser: Sendable {
     var tokenUsage: TokenUsage?
     var didError = false
     fileprivate var activity: ProviderActivity = .unknown
+    var statusEvidence = AgentStatusEvidence()
     var tools: [String: ToolCallSummary] = [:]
     var toolOrder: [String] = []
     var lineNumber = 0
@@ -463,40 +464,55 @@ struct CodexSessionParser: Sendable {
             || line.contains("\"tool_search_output\"")
             || line.contains("\"web_search_call\"")
             || line.contains("\"web_search_end\"")
+            || line.contains("\"message\"")
+            || line.contains("\"user_message\"")
+            || line.contains("\"agent_message\"")
     }
 
     mutating func parseEventMessage(_ payload: JSONDictionary, timestamp: Date?) {
         let eventType = JSONHelpers.string(payload, keys: ["type"])
         switch eventType {
         case "task_started":
-            activity = .active
+            markUserInput(at: timestamp)
             title = title ?? JSONHelpers.string(payload, keys: ["title", "summary"]).map { JSONHelpers.truncatedTitle($0) }
         case "task_complete":
             activity = .finished
+            statusEvidence.providerTerminalState = .complete
+            clearOpenActivity()
         case "turn_aborted":
             if hasErrorMarker(payload) {
                 didError = true
                 activity = .errored
+                statusEvidence.providerTerminalState = .error
             } else {
                 activity = .finished
+                statusEvidence.providerTerminalState = .complete
             }
+            clearOpenActivity()
         case "token_count":
             let info = JSONHelpers.dictionary(payload, key: "info")
             tokenUsage = JSONHelpers.tokenUsage(from: JSONHelpers.dictionary(info ?? [:], key: "total_token_usage"))
                 ?? JSONHelpers.tokenUsage(from: info)
                 ?? tokenUsage
         case "exec_command_end":
+            markAssistantOrToolActivity(at: timestamp)
             let exitCode = JSONHelpers.int(payload, keys: ["exit_code", "exitCode"])
                 ?? JSONHelpers.int(JSONHelpers.dictionary(payload, key: "info") ?? [:], keys: ["exit_code", "exitCode"])
             if let exitCode, exitCode != 0 {
                 didError = true
                 activity = .errored
+                statusEvidence.providerTerminalState = .error
             }
             closeTool(id: JSONHelpers.string(payload, keys: ["call_id", "callId", "id"]), at: timestamp)
+        case "agent_message":
+            markAssistantOrToolActivity(at: timestamp)
+        case "user_message", "user_input":
+            markUserInput(at: timestamp)
         default:
             if eventType?.localizedCaseInsensitiveContains("error") == true || hasErrorMarker(payload) {
                 didError = true
                 activity = .errored
+                statusEvidence.providerTerminalState = .error
             }
             break
         }
@@ -513,9 +529,11 @@ struct CodexSessionParser: Sendable {
                 at: timestamp
             )
         case "function_call_output":
+            markAssistantOrToolActivity(at: timestamp)
             if JSONHelpers.string(payload, keys: ["error"]) != nil {
                 didError = true
                 activity = .errored
+                statusEvidence.providerTerminalState = .error
             }
             closeTool(id: JSONHelpers.string(payload, keys: ["call_id", "callId", "id"]), at: timestamp)
         case "custom_tool_call":
@@ -526,9 +544,11 @@ struct CodexSessionParser: Sendable {
                 at: timestamp
             )
         case "custom_tool_call_output":
+            markAssistantOrToolActivity(at: timestamp)
             if hasErrorMarker(payload) {
                 didError = true
                 activity = .errored
+                statusEvidence.providerTerminalState = .error
             }
             closeTool(id: JSONHelpers.string(payload, keys: ["call_id", "callId", "id"]), at: timestamp)
         case "tool_search_call":
@@ -539,13 +559,15 @@ struct CodexSessionParser: Sendable {
                 at: timestamp
             )
         case "tool_search_output":
+            markAssistantOrToolActivity(at: timestamp)
             if hasErrorMarker(payload) {
                 didError = true
                 activity = .errored
+                statusEvidence.providerTerminalState = .error
             }
             closeTool(id: JSONHelpers.string(payload, keys: ["call_id", "callId", "id"]), at: timestamp)
         case "message":
-            break
+            parseMessage(payload, timestamp: timestamp)
         case "web_search_call":
             let status = JSONHelpers.string(payload, keys: ["status"]) ?? "running"
             startTool(
@@ -558,11 +580,13 @@ struct CodexSessionParser: Sendable {
                 closeTool(id: JSONHelpers.string(payload, keys: ["id", "call_id", "callId"]), at: timestamp)
             }
         case "web_search_end":
+            markAssistantOrToolActivity(at: timestamp)
             closeTool(id: JSONHelpers.string(payload, keys: ["id", "call_id", "callId"]), at: timestamp)
         default:
             if hasErrorMarker(payload) {
                 didError = true
                 activity = .errored
+                statusEvidence.providerTerminalState = .error
             }
             break
         }
@@ -570,6 +594,7 @@ struct CodexSessionParser: Sendable {
 
     mutating func startTool(id: String?, name: String, status: String, at timestamp: Date?) {
         activity = .active
+        markAssistantOrToolActivity(at: timestamp)
         let key = id ?? UUID().uuidString
         let completedAt = status.lowercased() == "completed" ? timestamp : nil
         tools[key] = ToolCallSummary(
@@ -582,6 +607,12 @@ struct CodexSessionParser: Sendable {
         )
         if !toolOrder.contains(key) {
             toolOrder.append(key)
+        }
+        if completedAt == nil {
+            statusEvidence.openActivityKind = .toolCall
+            statusEvidence.openActivityStartedAt = timestamp
+            statusEvidence.openActivityUpdatedAt = timestamp
+            statusEvidence.providerTerminalState = .running
         }
     }
 
@@ -608,6 +639,47 @@ struct CodexSessionParser: Sendable {
         tool.completedAt = completedAt ?? updatedAt ?? now
         tool.ageSeconds = nil
         tools[key] = tool
+        markAssistantOrToolActivity(at: tool.completedAt)
+        if !tools.values.contains(where: { $0.isIncomplete }) {
+            clearOpenActivity()
+        }
+    }
+
+    mutating func parseMessage(_ payload: JSONDictionary, timestamp: Date?) {
+        let role = JSONHelpers.string(payload, keys: ["role"])
+            ?? JSONHelpers.string(JSONHelpers.dictionary(payload, key: "message") ?? [:], keys: ["role"])
+        if role == "user" {
+            markUserInput(at: timestamp)
+        } else {
+            markAssistantOrToolActivity(at: timestamp)
+        }
+    }
+
+    mutating func markAssistantOrToolActivity(at timestamp: Date?) {
+        guard let timestamp else {
+            return
+        }
+        statusEvidence.lastAssistantOrToolActivityAt = maxDate(statusEvidence.lastAssistantOrToolActivityAt, timestamp)
+    }
+
+    mutating func markUserInput(at timestamp: Date?) {
+        guard let timestamp else {
+            return
+        }
+        statusEvidence.lastUserInputAt = maxDate(statusEvidence.lastUserInputAt, timestamp)
+    }
+
+    mutating func clearOpenActivity() {
+        statusEvidence.openActivityKind = nil
+        statusEvidence.openActivityStartedAt = nil
+        statusEvidence.openActivityUpdatedAt = nil
+    }
+
+    func maxDate(_ lhs: Date?, _ rhs: Date) -> Date {
+        guard let lhs else {
+            return rhs
+        }
+        return max(lhs, rhs)
     }
 
     func hasErrorMarker(_ payload: JSONDictionary) -> Bool {
@@ -625,7 +697,12 @@ struct CodexSessionParser: Sendable {
 
     func summary() -> AgentSummary? {
         let fileModified = (try? fileURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
-        let lastActivityAt = [updatedAt, fileModified].compactMap { $0 }.max()
+        let lastActivityAt = [
+            updatedAt,
+            fileModified,
+            statusEvidence.lastAssistantOrToolActivityAt,
+            statusEvidence.lastUserInputAt
+        ].compactMap { $0 }.max()
         let id = sessionID ?? fileURL.deletingPathExtension().lastPathComponent
         let fallbackTitle: String
         if let cwd {
@@ -636,6 +713,14 @@ struct CodexSessionParser: Sendable {
         let activeTool = toolOrder
             .compactMap { tools[$0] }
             .last(where: { $0.isIncomplete })
+        var evidence = statusEvidence
+        evidence.providerTerminalState = didError ? .error : activity.providerTerminalState
+        evidence.evidenceObservedAt = fileModified ?? updatedAt
+        if activeTool == nil {
+            evidence.openActivityKind = nil
+            evidence.openActivityStartedAt = nil
+            evidence.openActivityUpdatedAt = nil
+        }
 
         return AgentSummary(
             id: id,
@@ -647,6 +732,7 @@ struct CodexSessionParser: Sendable {
             lastActivityAt: lastActivityAt,
             tokenUsage: tokenUsage,
             activeTool: activeTool,
+            statusEvidence: evidence,
             diagnostics: diagnostics
         )
     }
@@ -659,6 +745,19 @@ fileprivate enum ProviderActivity: Sendable {
     case unknown
 
     var agentStatus: AgentStatus {
+        switch self {
+        case .active:
+            .running
+        case .finished:
+            .complete
+        case .errored:
+            .error
+        case .unknown:
+            .unknown
+        }
+    }
+
+    var providerTerminalState: ProviderTerminalState {
         switch self {
         case .active:
             .running

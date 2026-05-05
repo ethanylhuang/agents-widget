@@ -21,11 +21,13 @@ public final class AgentMonitor: ObservableObject {
     @Published public private(set) var isRefreshing = false
     @Published public private(set) var diagnostics: [String] = []
     @Published public private(set) var lastRefreshProfile: RefreshProfile?
+    @Published public private(set) var attentionCount = 0
 
     private let worker: AgentRefreshWorker
     private let dateProvider: any DateProviding
     private let eventSource: (any AgentEventSourcing)?
     private let eventDebounceNanoseconds: UInt64
+    private let menuOpenRefreshThrottleInterval: TimeInterval
     private let menuCloseGraceNanoseconds: UInt64
     private var eventDebounceTask: Task<Void, Never>?
     private var menuCloseTask: Task<Void, Never>?
@@ -33,6 +35,9 @@ public final class AgentMonitor: ObservableObject {
     private var pendingRefreshScope: RefreshScope?
     private var pendingDebouncedScope: RefreshScope?
     private var processExitWatchers: [Int32: DispatchSourceProcess] = [:]
+    private var previousStatusesByID: [String: AgentStatus] = [:]
+    private var previousTerminalBackedIDs: Set<String> = []
+    private var lastMenuOpenRefreshAt: Date?
     private var didStart = false
     private var isMenuVisible = false
     private var isEventSourceRunning = false
@@ -46,7 +51,7 @@ public final class AgentMonitor: ObservableObject {
         eventSource: (any AgentEventSourcing)? = nil,
         eventDebounceNanoseconds: UInt64 = 250_000_000,
         menuTickIntervalNanoseconds: UInt64 = 2_000_000_000,
-        menuOpenRefreshThrottleInterval: TimeInterval = 60,
+        menuOpenRefreshThrottleInterval: TimeInterval = 5,
         menuCloseGraceNanoseconds: UInt64 = 3_000_000_000
     ) {
         self.worker = AgentRefreshWorker(
@@ -58,9 +63,9 @@ public final class AgentMonitor: ObservableObject {
         self.dateProvider = dateProvider
         self.eventSource = eventSource
         self.eventDebounceNanoseconds = eventDebounceNanoseconds
+        self.menuOpenRefreshThrottleInterval = menuOpenRefreshThrottleInterval
         self.menuCloseGraceNanoseconds = menuCloseGraceNanoseconds
         _ = menuTickIntervalNanoseconds
-        _ = menuOpenRefreshThrottleInterval
     }
 
     public static func live() -> AgentMonitor {
@@ -102,6 +107,8 @@ public final class AgentMonitor: ObservableObject {
         if isVisible {
             menuCloseTask?.cancel()
             menuCloseTask = nil
+            startEventSourceIfNeeded()
+            requestMenuOpenRefreshIfAllowed()
         } else {
             scheduleHiddenTeardown()
         }
@@ -165,13 +172,22 @@ public final class AgentMonitor: ObservableObject {
     }
 
     private func completeRefresh(_ result: AgentRefreshResult) {
-        agents = result.agents
+        let withAttention = Self.applyAttention(
+            to: result.agents,
+            previousStatuses: previousStatusesByID,
+            previousTerminalBackedIDs: previousTerminalBackedIDs
+        )
+        let sortedAgents = Self.sortedAgents(withAttention)
+        agents = sortedAgents
+        attentionCount = sortedAgents.filter(\.needsAttention).count
         diagnostics = result.diagnostics
         lastRefreshAt = result.refreshedAt
         lastRefreshDuration = result.duration
         lastRefreshProfile = result.profile
         activeRefreshTask = nil
-        updateProcessExitWatchers(for: result.agents)
+        previousStatusesByID = Dictionary(uniqueKeysWithValues: sortedAgents.map { ($0.id, $0.status) })
+        previousTerminalBackedIDs = Set(sortedAgents.filter(\.isTerminalBacked).map(\.id))
+        updateProcessExitWatchers(for: sortedAgents)
 
         if let pendingRefreshScope {
             self.pendingRefreshScope = nil
@@ -179,6 +195,16 @@ public final class AgentMonitor: ObservableObject {
         } else {
             isRefreshing = false
         }
+    }
+
+    private func requestMenuOpenRefreshIfAllowed() {
+        let now = dateProvider.now()
+        if let lastMenuOpenRefreshAt,
+           now.timeIntervalSince(lastMenuOpenRefreshAt) < menuOpenRefreshThrottleInterval {
+            return
+        }
+        lastMenuOpenRefreshAt = now
+        requestRefresh(scope: .full(forceDetails: false, mode: .bounded, reason: .menuOpen))
     }
 
     func handleEvent(_ trigger: AgentRefreshTrigger) {
@@ -302,6 +328,7 @@ public final class AgentMonitor: ObservableObject {
     }
 
     public nonisolated static func merge(processes: [ProcessSnapshot], sessions: [AgentSummary], now: Date) -> [AgentSummary] {
+        let classifier = AgentStatusClassifier()
         var unmatchedSessions = sessions
         var merged: [AgentSummary] = []
 
@@ -309,29 +336,22 @@ public final class AgentMonitor: ObservableObject {
             let matchIndex = bestMatchIndex(for: process, sessions: unmatchedSessions)
             if let matchIndex {
                 var summary = unmatchedSessions.remove(at: matchIndex)
-                apply(process: process, to: &summary, now: now)
+                apply(process: process, to: &summary, now: now, classifier: classifier)
                 merged.append(summary)
             } else {
-                merged.append(summary(for: process, now: now))
+                merged.append(summary(for: process, now: now, classifier: classifier))
             }
         }
 
         for session in unmatchedSessions {
             var summary = session
-            summary.status = status(for: summary, hasProcess: false, hasSession: true, now: now)
+            summary.status = classifier.classify(summary, hasLiveProcess: false, hasMatchedSession: true, now: now)
             summary.runtimeSeconds = runtime(startedAt: summary.startedAt, now: now)
             summary.idleSeconds = idle(lastActivityAt: summary.lastActivityAt, now: now)
             merged.append(summary)
         }
 
-        return merged.sorted { lhs, rhs in
-            let leftRank = statusRank(lhs.status)
-            let rightRank = statusRank(rhs.status)
-            if leftRank != rightRank {
-                return leftRank < rightRank
-            }
-            return (lhs.lastActivityAt ?? .distantPast) > (rhs.lastActivityAt ?? .distantPast)
-        }
+        return sortedAgents(merged)
     }
 
     nonisolated static func bestMatchIndex(for process: ProcessSnapshot, sessions: [AgentSummary]) -> Int? {
@@ -352,7 +372,12 @@ public final class AgentMonitor: ObservableObject {
         }
     }
 
-    nonisolated static func apply(process: ProcessSnapshot, to summary: inout AgentSummary, now: Date) {
+    nonisolated static func apply(
+        process: ProcessSnapshot,
+        to summary: inout AgentSummary,
+        now: Date,
+        classifier: AgentStatusClassifier = AgentStatusClassifier()
+    ) {
         summary.pid = process.pid
         summary.tty = process.tty
         summary.cwd = summary.cwd ?? process.cwd
@@ -362,10 +387,14 @@ public final class AgentMonitor: ObservableObject {
         if let tty = process.tty {
             summary.terminalTarget = TerminalTarget(tty: tty, pid: process.pid)
         }
-        summary.status = status(for: summary, hasProcess: true, hasSession: true, now: now)
+        summary.status = classifier.classify(summary, hasLiveProcess: true, hasMatchedSession: true, now: now)
     }
 
-    nonisolated static func summary(for process: ProcessSnapshot, now: Date) -> AgentSummary {
+    nonisolated static func summary(
+        for process: ProcessSnapshot,
+        now: Date,
+        classifier: AgentStatusClassifier = AgentStatusClassifier()
+    ) -> AgentSummary {
         var summary = AgentSummary(
             id: "\(process.provider.rawValue)-pid-\(process.pid)",
             provider: process.provider,
@@ -382,35 +411,8 @@ public final class AgentMonitor: ObservableObject {
         if let tty = process.tty {
             summary.terminalTarget = TerminalTarget(tty: tty, pid: process.pid)
         }
-        summary.status = status(for: summary, hasProcess: true, hasSession: false, now: now)
+        summary.status = classifier.classify(summary, hasLiveProcess: true, hasMatchedSession: false, now: now)
         return summary
-    }
-
-    nonisolated static func status(for summary: AgentSummary, hasProcess: Bool, hasSession: Bool, now: Date) -> AgentStatus {
-        let hasActiveTool = summary.activeTool?.isIncomplete == true
-
-        if hasProcess, hasActiveTool {
-            let activeAge = summary.activeTool.flatMap { tool in
-                tool.ageSeconds ?? tool.startedAt.map { now.timeIntervalSince($0) }
-            } ?? idle(lastActivityAt: summary.lastActivityAt ?? summary.startedAt, now: now) ?? 0
-            return activeAge >= 90 ? .stuck : .running
-        }
-
-        if hasProcess {
-            if !hasSession || summary.status == .complete {
-                return .idle
-            }
-            return .running
-        }
-
-        if summary.status == .error {
-            return .error
-        }
-
-        if summary.status == .complete {
-            return .complete
-        }
-        return .unknown
     }
 
     nonisolated static func runtime(startedAt: Date?, now: Date) -> TimeInterval? {
@@ -435,6 +437,71 @@ public final class AgentMonitor: ObservableObject {
             4
         case .unknown:
             5
+        }
+    }
+
+    public nonisolated static func filteredAgents(_ agents: [AgentSummary], filter: AgentListFilter) -> [AgentSummary] {
+        switch filter {
+        case .activeTerminal:
+            agents.filter(\.isTerminalBacked)
+        case .allTasks:
+            agents
+        }
+    }
+
+    public nonisolated static func applyAttention(
+        to agents: [AgentSummary],
+        previousStatuses: [String: AgentStatus],
+        previousTerminalBackedIDs: Set<String>
+    ) -> [AgentSummary] {
+        agents.map { agent in
+            var updated = agent
+            updated.attentionReasons = attentionReasons(
+                for: agent,
+                previousStatus: previousStatuses[agent.id],
+                wasTerminalBacked: previousTerminalBackedIDs.contains(agent.id)
+            )
+            return updated
+        }
+    }
+
+    public nonisolated static func attentionReasons(
+        for agent: AgentSummary,
+        previousStatus: AgentStatus?,
+        wasTerminalBacked: Bool
+    ) -> [AgentAttentionReason] {
+        var reasons: [AgentAttentionReason] = []
+        if agent.isTerminalBacked {
+            if agent.status == .stuck {
+                reasons.append(.stuck)
+            }
+            if agent.status == .error {
+                reasons.append(.error)
+            }
+        }
+        if agent.status == .complete,
+           [.running, .idle, .stuck].contains(previousStatus) || wasTerminalBacked {
+            reasons.append(.completed)
+        }
+        if agent.isTerminalBacked,
+           agent.status == .idle,
+           agent.statusEvidence?.openActivityKind == nil {
+            reasons.append(.inputNeeded)
+        }
+        return reasons
+    }
+
+    public nonisolated static func sortedAgents(_ agents: [AgentSummary]) -> [AgentSummary] {
+        agents.sorted { lhs, rhs in
+            if lhs.needsAttention != rhs.needsAttention {
+                return lhs.needsAttention
+            }
+            let leftRank = statusRank(lhs.status)
+            let rightRank = statusRank(rhs.status)
+            if leftRank != rightRank {
+                return leftRank < rightRank
+            }
+            return (lhs.lastActivityAt ?? .distantPast) > (rhs.lastActivityAt ?? .distantPast)
         }
     }
 }

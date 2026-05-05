@@ -1,8 +1,64 @@
 import SwiftUI
 
+struct AgentRowDisplayModel: Equatable {
+    var projectTitle: String
+    var sessionSubtitle: String?
+    var runtimeText: String
+    var tokenText: String
+    var statusText: String
+
+    init(agent: AgentSummary) {
+        projectTitle = AgentFormatters.formatProjectTitle(agent.cwd)
+        sessionSubtitle = Self.sessionSubtitle(
+            provider: agent.provider,
+            title: agent.title,
+            projectTitle: projectTitle
+        )
+        runtimeText = AgentFormatters.formatCompactDuration(agent.runtimeSeconds)
+        tokenText = AgentFormatters.formatCompactTokenCount(agent.tokenUsage?.totalTokens)
+        statusText = agent.status.rawValue.capitalized
+    }
+
+    private static func sessionSubtitle(provider: AgentProvider, title: String, projectTitle: String) -> String? {
+        let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanTitle.isEmpty else {
+            return nil
+        }
+
+        let normalizedProject = normalized(projectTitle)
+        let normalizedTitle = normalized(cleanTitle)
+        let providerPrefix = normalized(provider.displayName)
+        let withoutProviderPrefix = normalizedTitle
+            .replacingOccurrences(of: "\(providerPrefix) ", with: "")
+            .replacingOccurrences(of: "\(provider.rawValue) ", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if normalizedTitle == normalizedProject || withoutProviderPrefix == normalizedProject {
+            return nil
+        }
+        if normalizedTitle.hasSuffix(" \(normalizedProject)") && normalizedTitle.hasPrefix(providerPrefix) {
+            return nil
+        }
+        return AgentFormatters.formatSessionSubtitle(provider: provider, title: cleanTitle)
+    }
+
+    private static func normalized(_ value: String) -> String {
+        value
+            .lowercased()
+            .replacingOccurrences(of: "-", with: " ")
+            .replacingOccurrences(of: "_", with: " ")
+            .replacingOccurrences(of: ":", with: " ")
+            .split(separator: " ")
+            .joined(separator: " ")
+    }
+}
+
 public struct AgentRowView: View {
     let agent: AgentSummary
     let action: () -> Void
+    private var displayModel: AgentRowDisplayModel {
+        AgentRowDisplayModel(agent: agent)
+    }
 
     public init(agent: AgentSummary, action: @escaping () -> Void) {
         self.agent = agent
@@ -12,46 +68,51 @@ public struct AgentRowView: View {
     public var body: some View {
         Button(action: action) {
             HStack(alignment: .top, spacing: 10) {
-                VStack(spacing: 6) {
-                    Circle()
-                        .fill(statusColor)
-                        .frame(width: 8, height: 8)
-                    Image(systemName: providerSymbol)
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(providerColor)
-                        .frame(width: 18, height: 18)
-                }
-                .padding(.top, 3)
+                Circle()
+                    .fill(statusColor)
+                    .frame(width: 8, height: 8)
+                    .padding(.top, 5)
 
                 VStack(alignment: .leading, spacing: 4) {
-                    HStack(spacing: 6) {
-                        Text(agent.provider.displayName)
-                            .font(.caption2.weight(.semibold))
-                            .foregroundStyle(providerColor)
-                        Text(agent.status.rawValue.capitalized)
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Text(displayModel.projectTitle)
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
                         Spacer(minLength: 0)
+                        Text(displayModel.runtimeText)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
                     }
 
-                    Text(agent.title)
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(.primary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        if let sessionSubtitle = displayModel.sessionSubtitle {
+                            Text(sessionSubtitle)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        } else {
+                            Text(displayModel.statusText)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                        Spacer(minLength: 0)
+                        Text(displayModel.tokenText)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
 
-                    Text(metadataLine)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                        .help(agent.cwd ?? "")
-
-                    Text(metricsLine)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
+                    if displayModel.sessionSubtitle != nil {
+                        Text(displayModel.statusText)
+                            .font(.caption2.weight(.medium))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
                 }
             }
             .padding(.horizontal, 12)
@@ -60,45 +121,6 @@ public struct AgentRowView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-    }
-
-    private var metadataLine: String {
-        let path = AgentFormatters.formatPathBasename(agent.cwd)
-        let runtime = AgentFormatters.formatDuration(agent.runtimeSeconds)
-        let idle = AgentFormatters.formatDuration(agent.idleSeconds)
-        let terminal = agent.tty ?? Diagnostics.unknownTerminal
-        return "\(path) - runtime \(runtime) - idle \(idle) - \(terminal)"
-    }
-
-    private var metricsLine: String {
-        var parts: [String] = [
-            AgentFormatters.formatTokenCount(agent.tokenUsage?.totalTokens),
-            AgentFormatters.formatCostUSD(agent.costUSD)
-        ]
-        if let activeTool = agent.activeTool {
-            parts.append(AgentFormatters.formatTool(activeTool))
-        } else {
-            parts.append("No active tool")
-        }
-        return parts.joined(separator: " - ")
-    }
-
-    private var providerSymbol: String {
-        switch agent.provider {
-        case .codex:
-            "sparkles"
-        case .opencode:
-            "chevron.left.forwardslash.chevron.right"
-        }
-    }
-
-    private var providerColor: Color {
-        switch agent.provider {
-        case .codex:
-            .blue
-        case .opencode:
-            .orange
-        }
     }
 
     private var statusColor: Color {

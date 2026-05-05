@@ -1,11 +1,13 @@
 import AgentsWidgetCore
+import AppKit
+import Combine
 import Darwin
 import Foundation
 import SwiftUI
 
 @main
 struct AgentsWidgetApp: App {
-    @StateObject private var monitor: AgentMonitor
+    @NSApplicationDelegateAdaptor(AgentsWidgetAppDelegate.self) private var appDelegate
 
     init() {
         if CommandLine.arguments.contains("--profile-refresh") {
@@ -16,20 +18,109 @@ struct AgentsWidgetApp: App {
             SmokeProbe.run(attemptTerminalJump: CommandLine.arguments.contains("--smoke-terminal"))
             Foundation.exit(0)
         }
-
-        let liveMonitor = AgentMonitor.live()
-        _monitor = StateObject(wrappedValue: liveMonitor)
-        Task { @MainActor in
-            liveMonitor.start()
-            liveMonitor.warmCache()
-        }
     }
 
     var body: some Scene {
-        MenuBarExtra("Agents Widget", systemImage: "terminal") {
-            MenuBarRootView(monitor: monitor)
+        Settings {
+            EmptyView()
         }
-        .menuBarExtraStyle(.window)
+    }
+}
+
+@MainActor
+private final class AgentsWidgetAppDelegate: NSObject, NSApplicationDelegate {
+    private var statusItem: NSStatusItem?
+    private var popover: NSPopover?
+    private var monitor: AgentMonitor?
+    private var cancellables: Set<AnyCancellable> = []
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        let monitor = AgentMonitor.live()
+        self.monitor = monitor
+
+        let popover = NSPopover()
+        popover.behavior = .transient
+        let hostingController = NSHostingController(rootView: MenuBarRootView(monitor: monitor))
+        hostingController.sizingOptions = [.preferredContentSize]
+        popover.contentViewController = hostingController
+        self.popover = popover
+
+        let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        self.statusItem = statusItem
+        if let button = statusItem.button {
+            button.target = self
+            button.action = #selector(handleStatusItemClick(_:))
+            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        }
+
+        monitor.$attentionCount
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.updateStatusItem()
+            }
+            .store(in: &cancellables)
+
+        updateStatusItem()
+        monitor.start()
+        monitor.warmCache()
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        monitor?.stop()
+    }
+
+    @objc private func handleStatusItemClick(_ sender: NSStatusBarButton) {
+        if NSApp.currentEvent?.type == .rightMouseUp {
+            showContextMenu(from: sender)
+        } else {
+            togglePopover(from: sender)
+        }
+    }
+
+    @objc private func quit() {
+        NSApplication.shared.terminate(nil)
+    }
+
+    private func togglePopover(from sender: NSStatusBarButton) {
+        guard let popover else {
+            return
+        }
+        if popover.isShown {
+            popover.performClose(sender)
+        } else {
+            popover.show(relativeTo: sender.bounds, of: sender, preferredEdge: .minY)
+            NSApplication.shared.activate()
+        }
+    }
+
+    private func showContextMenu(from sender: NSStatusBarButton) {
+        popover?.performClose(sender)
+        let menu = NSMenu()
+        let quitItem = NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q")
+        quitItem.target = self
+        menu.addItem(quitItem)
+        if let event = NSApp.currentEvent {
+            NSMenu.popUpContextMenu(menu, with: event, for: sender)
+        } else {
+            menu.popUp(positioning: nil, at: NSPoint(x: 0, y: 0), in: sender)
+        }
+    }
+
+    private func updateStatusItem() {
+        guard let button = statusItem?.button else {
+            return
+        }
+        button.image = NSImage(systemSymbolName: "terminal", accessibilityDescription: "Agents")
+        button.imagePosition = .imageLeft
+        button.title = badgeTitle
+        button.toolTip = "Agents"
+    }
+
+    private var badgeTitle: String {
+        guard let attentionCount = monitor?.attentionCount, attentionCount > 0 else {
+            return ""
+        }
+        return attentionCount > 9 ? "9+" : "\(attentionCount)"
     }
 }
 
@@ -133,7 +224,11 @@ private enum SmokeProbe {
         let processes = ProcessSnapshotProvider().snapshots()
         let codex = CodexSessionStore().summaries(now: now)
         let openCode = OpenCodeSessionStore().summaries(now: now)
-        let merged = AgentMonitor.merge(processes: processes.value, sessions: codex.value + openCode.value, now: now)
+        let merged = AgentMonitor.sortedAgents(AgentMonitor.applyAttention(
+            to: AgentMonitor.merge(processes: processes.value, sessions: codex.value + openCode.value, now: now),
+            previousStatuses: [:],
+            previousTerminalBackedIDs: []
+        ))
         var terminalJumpResult: String?
 
         if attemptTerminalJump {
@@ -147,11 +242,10 @@ private enum SmokeProbe {
                 status: agent.status.rawValue,
                 title: agent.title,
                 hasPID: agent.pid != nil,
-                tty: agent.tty,
                 hasTokens: agent.tokenUsage?.totalTokens != nil,
-                hasCost: agent.costUSD != nil,
-                activeTool: agent.activeTool?.name,
-                hasTerminalTarget: agent.terminalTarget != nil
+                hasTerminalTarget: agent.terminalTarget != nil,
+                attentionReasons: agent.attentionReasons.map(\.rawValue),
+                hasStatusEvidence: agent.statusEvidence != nil
             )
         }
         let diagnostics = processes.diagnostics + codex.diagnostics + openCode.diagnostics
@@ -160,6 +254,8 @@ private enum SmokeProbe {
             openCodeSessionCount: openCode.value.count,
             processCount: processes.value.count,
             mergedAgentCount: merged.count,
+            visibleActiveCount: AgentMonitor.filteredAgents(merged, filter: .activeTerminal).count,
+            attentionCount: merged.filter(\.needsAttention).count,
             agents: smokeAgents,
             diagnostics: diagnostics,
             terminalJumpResult: terminalJumpResult
@@ -223,6 +319,8 @@ private struct SmokeReport: Encodable {
     var openCodeSessionCount: Int
     var processCount: Int
     var mergedAgentCount: Int
+    var visibleActiveCount: Int
+    var attentionCount: Int
     var agents: [SmokeAgent]
     var diagnostics: [String]
     var terminalJumpResult: String?
@@ -274,9 +372,8 @@ private struct SmokeAgent: Encodable {
     var status: String
     var title: String
     var hasPID: Bool
-    var tty: String?
     var hasTokens: Bool
-    var hasCost: Bool
-    var activeTool: String?
     var hasTerminalTarget: Bool
+    var attentionReasons: [String]
+    var hasStatusEvidence: Bool
 }

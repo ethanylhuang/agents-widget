@@ -22,6 +22,33 @@ public enum AgentFormatters {
         return String(format: "%.1fk tok", Double(tokens) / 1_000.0)
     }
 
+    public static func formatCompactDuration(_ seconds: TimeInterval?) -> String {
+        guard let seconds, seconds.isFinite, seconds >= 0 else {
+            return "Unknown"
+        }
+        let total = Int(seconds.rounded(.down))
+        if total < 3_600 {
+            return "\(total / 60)m"
+        }
+        if total < 86_400 {
+            return String(format: "%dh %02dm", total / 3_600, (total % 3_600) / 60)
+        }
+        return String(format: "%dd %02dh", total / 86_400, (total % 86_400) / 3_600)
+    }
+
+    public static func formatCompactTokenCount(_ tokens: Int?) -> String {
+        guard let tokens else {
+            return Diagnostics.tokensUnavailable
+        }
+        if tokens < 1_000 {
+            return "\(tokens) tok"
+        }
+        if tokens < 1_000_000 {
+            return String(format: "%.1fk tok", Double(tokens) / 1_000.0)
+        }
+        return String(format: "%.1fM tok", Double(tokens) / 1_000_000.0)
+    }
+
     public static func formatCostUSD(_ cost: Decimal?) -> String {
         guard let cost else {
             return Diagnostics.costUnavailable
@@ -42,15 +69,21 @@ public enum AgentFormatters {
         return name.isEmpty ? path : name
     }
 
-    public static func formatLastRefresh(_ date: Date?, now: Date = Date()) -> String {
-        guard let date else {
-            return "Never refreshed"
+    public static func formatProjectTitle(_ path: String?) -> String {
+        guard let path, !path.isEmpty else {
+            return "Unknown project"
         }
-        let age = max(0, now.timeIntervalSince(date))
-        if age < 60 {
-            return "Updated \(Int(age))s ago"
+        let url = URL(fileURLWithPath: path)
+        let name = url.lastPathComponent
+        return name.isEmpty ? "Unknown project" : name
+    }
+
+    public static func formatSessionSubtitle(provider: AgentProvider, title: String?) -> String {
+        let cleanTitle = title?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let cleanTitle, !cleanTitle.isEmpty else {
+            return "\(provider.displayName) session unavailable"
         }
-        return "Updated \(formatDuration(age)) ago"
+        return "\(provider.displayName) session: \(cleanTitle)"
     }
 
     public static func formatTool(_ tool: ToolCallSummary?) -> String {
