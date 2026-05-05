@@ -27,7 +27,6 @@ public final class AgentMonitor: ObservableObject {
     private let dateProvider: any DateProviding
     private let eventSource: (any AgentEventSourcing)?
     private let eventDebounceNanoseconds: UInt64
-    private let menuOpenRefreshThrottleInterval: TimeInterval
     private let menuCloseGraceNanoseconds: UInt64
     private var eventDebounceTask: Task<Void, Never>?
     private var menuCloseTask: Task<Void, Never>?
@@ -37,7 +36,6 @@ public final class AgentMonitor: ObservableObject {
     private var processExitWatchers: [Int32: DispatchSourceProcess] = [:]
     private var previousStatusesByID: [String: AgentStatus] = [:]
     private var previousTerminalBackedIDs: Set<String> = []
-    private var lastMenuOpenRefreshAt: Date?
     private var didStart = false
     private var isMenuVisible = false
     private var isEventSourceRunning = false
@@ -51,7 +49,6 @@ public final class AgentMonitor: ObservableObject {
         eventSource: (any AgentEventSourcing)? = nil,
         eventDebounceNanoseconds: UInt64 = 250_000_000,
         menuTickIntervalNanoseconds: UInt64 = 2_000_000_000,
-        menuOpenRefreshThrottleInterval: TimeInterval = 5,
         menuCloseGraceNanoseconds: UInt64 = 3_000_000_000
     ) {
         self.worker = AgentRefreshWorker(
@@ -63,7 +60,6 @@ public final class AgentMonitor: ObservableObject {
         self.dateProvider = dateProvider
         self.eventSource = eventSource
         self.eventDebounceNanoseconds = eventDebounceNanoseconds
-        self.menuOpenRefreshThrottleInterval = menuOpenRefreshThrottleInterval
         self.menuCloseGraceNanoseconds = menuCloseGraceNanoseconds
         _ = menuTickIntervalNanoseconds
     }
@@ -100,6 +96,7 @@ public final class AgentMonitor: ObservableObject {
     }
 
     public func setMenuVisible(_ isVisible: Bool) {
+        let wasMenuVisible = self.isMenuVisible
         isMenuVisible = isVisible
         guard didStart else {
             return
@@ -108,7 +105,9 @@ public final class AgentMonitor: ObservableObject {
             menuCloseTask?.cancel()
             menuCloseTask = nil
             startEventSourceIfNeeded()
-            requestMenuOpenRefreshIfAllowed()
+            if !wasMenuVisible {
+                requestMenuOpenRefresh()
+            }
         } else {
             scheduleHiddenTeardown()
         }
@@ -197,14 +196,8 @@ public final class AgentMonitor: ObservableObject {
         }
     }
 
-    private func requestMenuOpenRefreshIfAllowed() {
-        let now = dateProvider.now()
-        if let lastMenuOpenRefreshAt,
-           now.timeIntervalSince(lastMenuOpenRefreshAt) < menuOpenRefreshThrottleInterval {
-            return
-        }
-        lastMenuOpenRefreshAt = now
-        requestRefresh(scope: .full(forceDetails: false, mode: .bounded, reason: .menuOpen))
+    private func requestMenuOpenRefresh() {
+        requestRefresh(scope: .full(forceDetails: true, mode: .bounded, reason: .menuOpen))
     }
 
     func handleEvent(_ trigger: AgentRefreshTrigger) {

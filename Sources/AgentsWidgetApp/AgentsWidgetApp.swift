@@ -28,7 +28,7 @@ struct AgentsWidgetApp: App {
 }
 
 @MainActor
-private final class AgentsWidgetAppDelegate: NSObject, NSApplicationDelegate {
+private final class AgentsWidgetAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var statusItem: NSStatusItem?
     private var popover: NSPopover?
     private var monitor: AgentMonitor?
@@ -40,6 +40,7 @@ private final class AgentsWidgetAppDelegate: NSObject, NSApplicationDelegate {
 
         let popover = NSPopover()
         popover.behavior = .transient
+        popover.delegate = self
         let hostingController = NSHostingController(rootView: MenuBarRootView(monitor: monitor))
         hostingController.sizingOptions = [.preferredContentSize]
         popover.contentViewController = hostingController
@@ -87,14 +88,21 @@ private final class AgentsWidgetAppDelegate: NSObject, NSApplicationDelegate {
         }
         if popover.isShown {
             popover.performClose(sender)
+            monitor?.setMenuVisible(false)
         } else {
+            monitor?.setMenuVisible(true)
             popover.show(relativeTo: sender.bounds, of: sender, preferredEdge: .minY)
             NSApplication.shared.activate()
         }
     }
 
+    func popoverDidClose(_ notification: Notification) {
+        monitor?.setMenuVisible(false)
+    }
+
     private func showContextMenu(from sender: NSStatusBarButton) {
         popover?.performClose(sender)
+        monitor?.setMenuVisible(false)
         let menu = NSMenu()
         let quitItem = NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q")
         quitItem.target = self

@@ -293,21 +293,18 @@ final class AgentMonitorTests: XCTestCase {
     }
 
     @MainActor
-    func testMenuOpenRequestsBoundedRefreshWithThrottle() async throws {
+    func testMenuOpenRequestsFreshBoundedRefreshEveryOpen() async throws {
         let processProvider = CountingMonitorProcessProvider()
         let codexStore = CountingMonitorCodexStore()
         let openCodeStore = CountingMonitorOpenCodeStore()
         let eventSource = ManualAgentEventSource()
-        let dateProvider = MutableDateProvider(date: Date(timeIntervalSince1970: 1_000))
         let monitor = AgentMonitor(
             processProvider: processProvider,
             codexStore: codexStore,
             openCodeStore: openCodeStore,
-            dateProvider: dateProvider,
             eventSource: eventSource,
             eventDebounceNanoseconds: 10_000_000,
             menuTickIntervalNanoseconds: 10_000_000,
-            menuOpenRefreshThrottleInterval: 5,
             menuCloseGraceNanoseconds: 100_000_000
         )
 
@@ -324,25 +321,21 @@ final class AgentMonitorTests: XCTestCase {
         XCTAssertEqual(eventSource.stopCount, 0)
         XCTAssertEqual(monitor.lastRefreshProfile?.reason, .menuOpen)
 
-        monitor.setMenuVisible(false)
         monitor.setMenuVisible(true)
         try await Task.sleep(for: .milliseconds(50))
 
         XCTAssertEqual(processProvider.callCount, 1)
         XCTAssertEqual(codexStore.callCount, 1)
         XCTAssertEqual(openCodeStore.callCount, 1)
-        XCTAssertEqual(eventSource.startCount, 1)
-        XCTAssertEqual(eventSource.stopCount, 0)
 
-        dateProvider.advance(by: 5.1)
         monitor.setMenuVisible(false)
         monitor.setMenuVisible(true)
         try await waitForMainActorCondition(timeout: 1) {
             processProvider.callCount == 2 && !monitor.isRefreshing
         }
 
-        XCTAssertEqual(codexStore.callCount, 1)
-        XCTAssertEqual(openCodeStore.callCount, 1)
+        XCTAssertEqual(codexStore.callCount, 2)
+        XCTAssertEqual(openCodeStore.callCount, 2)
         XCTAssertEqual(eventSource.startCount, 1)
         XCTAssertEqual(monitor.lastRefreshProfile?.reason, .menuOpen)
         monitor.setMenuVisible(false)
@@ -562,27 +555,6 @@ private struct EmptyCodexStore: CodexSessionStoring {
 private struct EmptyOpenCodeStore: OpenCodeSessionStoring {
     func summaries(now: Date) -> ProviderResult<[AgentSummary]> {
         ProviderResult(value: [])
-    }
-}
-
-private final class MutableDateProvider: DateProviding, @unchecked Sendable {
-    private let lock = NSLock()
-    private var date: Date
-
-    init(date: Date) {
-        self.date = date
-    }
-
-    func now() -> Date {
-        lock.lock()
-        defer { lock.unlock() }
-        return date
-    }
-
-    func advance(by interval: TimeInterval) {
-        lock.lock()
-        date = date.addingTimeInterval(interval)
-        lock.unlock()
     }
 }
 
