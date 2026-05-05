@@ -3,7 +3,6 @@ import SwiftUI
 public struct AgentRowView: View {
     let agent: AgentSummary
     let action: () -> Void
-    @State private var isHovering = false
 
     public init(agent: AgentSummary, action: @escaping () -> Void) {
         self.agent = agent
@@ -58,13 +57,9 @@ public struct AgentRowView: View {
             .padding(.horizontal, 12)
             .padding(.vertical, 12)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(isHovering ? Color.primary.opacity(0.06) : Color.clear)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .onHover { hovering in
-            isHovering = hovering
-        }
     }
 
     private var metadataLine: String {

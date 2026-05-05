@@ -4,21 +4,37 @@ public protocol CodexSessionStoring: Sendable {
     func summaries(now: Date) -> ProviderResult<[AgentSummary]>
 }
 
-public final class CodexSessionStore: CodexSessionStoring, @unchecked Sendable {
+public final class CodexSessionStore: CodexSessionStoring, ModeAwareCodexSessionStoring, @unchecked Sendable {
     let baseURL: URL
     let maxFiles: Int
+    let boundedFileLimit: Int
+    let coldParseByteLimit: Int
+    let prefixWindowBytes: Int
+    let tailWindowBytes: Int
     private let cacheLock = NSLock()
     private var summaryCache: [String: CodexCachedSummary] = [:]
 
     public init(
         baseURL: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/sessions"),
-        maxFiles: Int = 50
+        maxFiles: Int = 50,
+        boundedFileLimit: Int = 12,
+        coldParseByteLimit: Int = 262_144,
+        prefixWindowBytes: Int = 16_384,
+        tailWindowBytes: Int = 131_072
     ) {
         self.baseURL = baseURL
         self.maxFiles = maxFiles
+        self.boundedFileLimit = boundedFileLimit
+        self.coldParseByteLimit = coldParseByteLimit
+        self.prefixWindowBytes = prefixWindowBytes
+        self.tailWindowBytes = tailWindowBytes
     }
 
     public func summaries(now: Date) -> ProviderResult<[AgentSummary]> {
+        summaries(now: now, mode: .bounded)
+    }
+
+    public func summaries(now: Date, mode: SessionRefreshMode) -> ProviderResult<[AgentSummary]> {
         guard FileManager.default.fileExists(atPath: baseURL.path) else {
             return ProviderResult(value: [], diagnostics: [Diagnostics.codex("session directory unavailable")])
         }
@@ -26,25 +42,19 @@ public final class CodexSessionStore: CodexSessionStoring, @unchecked Sendable {
         let files = jsonlFiles()
         var diagnostics: [String] = []
         var summaries: [AgentSummary] = []
-        let selectedFiles = Array(files.prefix(maxFiles))
+        var metrics = ProviderMetrics()
+        let fileLimit = mode == .bounded ? min(maxFiles, boundedFileLimit) : maxFiles
+        let selectedFiles = Array(files.prefix(fileLimit))
         pruneCache(keeping: selectedFiles)
         for file in selectedFiles {
             let metadata = metadata(for: file)
-            if let cached = cachedSummary(for: file, metadata: metadata, now: now) {
-                diagnostics.append(contentsOf: cached.diagnostics)
-                if let summary = cached.value {
-                    summaries.append(summary)
-                }
-                continue
-            }
-            let result = parseFile(file, now: now)
-            storeCachedSummary(for: file, metadata: metadata, result: result)
+            let result = summary(for: file, metadata: metadata, now: now, mode: mode, metrics: &metrics)
             diagnostics.append(contentsOf: result.diagnostics)
             if let summary = result.value {
                 summaries.append(summary)
             }
         }
-        return ProviderResult(value: summaries, diagnostics: diagnostics)
+        return ProviderResult(value: summaries, diagnostics: diagnostics, metrics: metrics)
     }
 
     private func metadata(for url: URL) -> CodexFileMetadata? {
@@ -58,39 +68,81 @@ public final class CodexSessionStore: CodexSessionStoring, @unchecked Sendable {
         )
     }
 
+    private func summary(
+        for url: URL,
+        metadata: CodexFileMetadata?,
+        now: Date,
+        mode: SessionRefreshMode,
+        metrics: inout ProviderMetrics
+    ) -> ProviderResult<AgentSummary?> {
+        if let cached = cachedSummary(for: url, metadata: metadata, now: now, mode: mode) {
+            return cached
+        }
+
+        if mode == .bounded,
+           let metadata,
+           let size = metadata.size,
+           let cached = cachedEntry(for: url),
+           size > cached.cursorOffset {
+            let result = parseAppendedBytes(
+                url,
+                cached: cached,
+                metadata: metadata,
+                now: now,
+                metrics: &metrics
+            )
+            storeCachedSummary(for: url, metadata: metadata, parsed: result)
+            return result.providerResult
+        }
+
+        let result = parseFile(url, metadata: metadata, now: now, mode: mode, metrics: &metrics)
+        storeCachedSummary(for: url, metadata: metadata, parsed: result)
+        return result.providerResult
+    }
+
+    private func cachedEntry(for url: URL) -> CodexCachedSummary? {
+        cacheLock.lock()
+        let cached = summaryCache[url.path]
+        cacheLock.unlock()
+        return cached
+    }
+
     private func cachedSummary(
         for url: URL,
         metadata: CodexFileMetadata?,
-        now: Date
+        now: Date,
+        mode: SessionRefreshMode
     ) -> ProviderResult<AgentSummary?>? {
         guard let metadata else {
             return nil
         }
-        cacheLock.lock()
-        let cached = summaryCache[url.path]
-        cacheLock.unlock()
+        let cached = cachedEntry(for: url)
         guard let cached, cached.metadata == metadata else {
             return nil
         }
+        var parser = cached.parser
+        parser.now = now
         return ProviderResult(
-            value: cached.summary?.refreshedDynamicFields(now: now),
-            diagnostics: cached.diagnostics
+            value: parser.summary()?.refreshedDynamicFields(now: now),
+            diagnostics: parser.diagnostics
         )
     }
 
     private func storeCachedSummary(
         for url: URL,
         metadata: CodexFileMetadata?,
-        result: ProviderResult<AgentSummary?>
+        parsed: CodexParsedSummary
     ) {
-        guard let metadata else {
+        guard let metadata, let parser = parsed.parser else {
             return
         }
         cacheLock.lock()
         summaryCache[url.path] = CodexCachedSummary(
             metadata: metadata,
-            summary: result.value,
-            diagnostics: result.diagnostics
+            parser: parser,
+            cursorOffset: parsed.cursorOffset,
+            pendingFragment: parsed.pendingFragment,
+            isCompleteParse: parsed.isCompleteParse
         )
         cacheLock.unlock()
     }
@@ -125,22 +177,194 @@ public final class CodexSessionStore: CodexSessionStoring, @unchecked Sendable {
         }
     }
 
-    func parseFile(_ url: URL, now: Date) -> ProviderResult<AgentSummary?> {
+    private func parseFile(
+        _ url: URL,
+        metadata: CodexFileMetadata?,
+        now: Date,
+        mode: SessionRefreshMode,
+        metrics: inout ProviderMetrics
+    ) -> CodexParsedSummary {
         guard let handle = try? FileHandle(forReadingFrom: url) else {
-            return ProviderResult(value: nil, diagnostics: [Diagnostics.codex("could not read \(url.lastPathComponent)")])
+            return CodexParsedSummary(
+                parser: nil,
+                cursorOffset: metadata?.size ?? 0,
+                pendingFragment: "",
+                isCompleteParse: false,
+                providerResult: ProviderResult(value: nil, diagnostics: [Diagnostics.codex("could not read \(url.lastPathComponent)")])
+            )
         }
         defer { try? handle.close() }
 
+        if let size = metadata?.size,
+           size > Int64(coldParseByteLimit) {
+            return parseColdWindow(url, handle: handle, fileSize: size, now: now, metrics: &metrics)
+        }
+
         let data = handle.readDataToEndOfFile()
+        metrics.bytesRead += Int64(data.count)
+        metrics.filesParsed += 1
         guard let text = String(data: data, encoding: .utf8) else {
-            return ProviderResult(value: nil, diagnostics: [Diagnostics.codex("non-UTF8 session \(url.lastPathComponent)")])
+            return CodexParsedSummary(
+                parser: nil,
+                cursorOffset: metadata?.size ?? Int64(data.count),
+                pendingFragment: "",
+                isCompleteParse: false,
+                providerResult: ProviderResult(value: nil, diagnostics: [Diagnostics.codex("non-UTF8 session \(url.lastPathComponent)")])
+            )
         }
 
         var parser = CodexSessionParser(fileURL: url, now: now)
-        text.enumerateLines { line, _ in
-            parser.parseLine(line)
+        parseCompleteLines(text, parser: &parser)
+        return CodexParsedSummary(
+            parser: parser,
+            cursorOffset: metadata?.size ?? Int64(data.count),
+            pendingFragment: "",
+            isCompleteParse: true,
+            providerResult: ProviderResult(value: parser.summary(), diagnostics: parser.diagnostics)
+        )
+    }
+
+    private func parseColdWindow(
+        _ url: URL,
+        handle: FileHandle,
+        fileSize: Int64,
+        now: Date,
+        metrics: inout ProviderMetrics
+    ) -> CodexParsedSummary {
+        var parser = CodexSessionParser(fileURL: url, now: now)
+        var diagnostics: [String] = []
+        let prefixLength = min(prefixWindowBytes, Int(fileSize))
+        let tailLength = min(tailWindowBytes, Int(fileSize))
+        let tailOffset = max(Int64(prefixLength), fileSize - Int64(tailLength))
+
+        do {
+            try handle.seek(toOffset: 0)
+            let prefix = handle.readData(ofLength: prefixLength)
+            metrics.bytesRead += Int64(prefix.count)
+            if let text = String(data: prefix, encoding: .utf8) {
+                parseCompleteLines(prefixLength < Int(fileSize) ? trimTrailingPartialLine(text) : text, parser: &parser)
+            } else {
+                diagnostics.append(Diagnostics.codex("non-UTF8 session prefix \(url.lastPathComponent)"))
+            }
+
+            if tailOffset < fileSize {
+                try handle.seek(toOffset: UInt64(tailOffset))
+                let tail = handle.readDataToEndOfFile()
+                metrics.bytesRead += Int64(tail.count)
+                if let text = String(data: tail, encoding: .utf8) {
+                    parseCompleteLines(trimLeadingPartialLine(text), parser: &parser)
+                } else {
+                    diagnostics.append(Diagnostics.codex("non-UTF8 session tail \(url.lastPathComponent)"))
+                }
+            }
+        } catch {
+            diagnostics.append(Diagnostics.codex("could not seek \(url.lastPathComponent): \(error.localizedDescription)"))
         }
-        return ProviderResult(value: parser.summary(), diagnostics: parser.diagnostics)
+
+        metrics.filesParsed += 1
+        parser.diagnostics.append(contentsOf: diagnostics)
+        return CodexParsedSummary(
+            parser: parser,
+            cursorOffset: fileSize,
+            pendingFragment: "",
+            isCompleteParse: false,
+            providerResult: ProviderResult(value: parser.summary(), diagnostics: parser.diagnostics)
+        )
+    }
+
+    private func parseAppendedBytes(
+        _ url: URL,
+        cached: CodexCachedSummary,
+        metadata: CodexFileMetadata,
+        now: Date,
+        metrics: inout ProviderMetrics
+    ) -> CodexParsedSummary {
+        guard let size = metadata.size, size > cached.cursorOffset else {
+            var parser = cached.parser
+            parser.now = now
+            return CodexParsedSummary(
+                parser: parser,
+                cursorOffset: cached.cursorOffset,
+                pendingFragment: cached.pendingFragment,
+                isCompleteParse: cached.isCompleteParse,
+                providerResult: ProviderResult(value: parser.summary()?.refreshedDynamicFields(now: now), diagnostics: parser.diagnostics)
+            )
+        }
+
+        var parser = cached.parser
+        parser.now = now
+        var pendingFragment = cached.pendingFragment
+        guard let handle = try? FileHandle(forReadingFrom: url) else {
+            return CodexParsedSummary(
+                parser: parser,
+                cursorOffset: cached.cursorOffset,
+                pendingFragment: pendingFragment,
+                isCompleteParse: cached.isCompleteParse,
+                providerResult: ProviderResult(value: parser.summary()?.refreshedDynamicFields(now: now), diagnostics: parser.diagnostics + [Diagnostics.codex("could not read appended bytes \(url.lastPathComponent)")])
+            )
+        }
+        defer { try? handle.close() }
+
+        do {
+            try handle.seek(toOffset: UInt64(cached.cursorOffset))
+            let data = handle.readDataToEndOfFile()
+            metrics.bytesRead += Int64(data.count)
+            metrics.filesParsed += 1
+            guard let text = String(data: data, encoding: .utf8) else {
+                parser.diagnostics.append(Diagnostics.codex("non-UTF8 session append \(url.lastPathComponent)"))
+                return CodexParsedSummary(
+                    parser: parser,
+                    cursorOffset: size,
+                    pendingFragment: "",
+                    isCompleteParse: cached.isCompleteParse,
+                    providerResult: ProviderResult(value: parser.summary()?.refreshedDynamicFields(now: now), diagnostics: parser.diagnostics)
+                )
+            }
+            pendingFragment = parseAppendedText(pendingFragment + text, parser: &parser)
+        } catch {
+            parser.diagnostics.append(Diagnostics.codex("could not seek append \(url.lastPathComponent): \(error.localizedDescription)"))
+        }
+
+        return CodexParsedSummary(
+            parser: parser,
+            cursorOffset: size,
+            pendingFragment: pendingFragment,
+            isCompleteParse: cached.isCompleteParse,
+            providerResult: ProviderResult(value: parser.summary()?.refreshedDynamicFields(now: now), diagnostics: parser.diagnostics)
+        )
+    }
+
+    private func parseCompleteLines(_ text: String, parser: inout CodexSessionParser) {
+        for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            parser.parseLine(String(line).trimmingCharacters(in: CharacterSet(charactersIn: "\r")))
+        }
+    }
+
+    private func parseAppendedText(_ text: String, parser: inout CodexSessionParser) -> String {
+        guard !text.isEmpty else {
+            return ""
+        }
+        let hasTrailingNewline = text.hasSuffix("\n") || text.hasSuffix("\r")
+        var lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        let pending = hasTrailingNewline ? "" : (lines.popLast() ?? "")
+        for line in lines {
+            parser.parseLine(line.trimmingCharacters(in: CharacterSet(charactersIn: "\r")))
+        }
+        return pending
+    }
+
+    private func trimLeadingPartialLine(_ text: String) -> String {
+        guard let newlineIndex = text.firstIndex(of: "\n") else {
+            return ""
+        }
+        return String(text[text.index(after: newlineIndex)...])
+    }
+
+    private func trimTrailingPartialLine(_ text: String) -> String {
+        guard let newlineIndex = text.lastIndex(of: "\n") else {
+            return ""
+        }
+        return String(text[...newlineIndex])
     }
 }
 
@@ -151,13 +375,23 @@ private struct CodexFileMetadata: Equatable, Sendable {
 
 private struct CodexCachedSummary: Sendable {
     var metadata: CodexFileMetadata
-    var summary: AgentSummary?
-    var diagnostics: [String]
+    var parser: CodexSessionParser
+    var cursorOffset: Int64
+    var pendingFragment: String
+    var isCompleteParse: Bool
 }
 
-struct CodexSessionParser {
+private struct CodexParsedSummary: Sendable {
+    var parser: CodexSessionParser?
+    var cursorOffset: Int64
+    var pendingFragment: String
+    var isCompleteParse: Bool
+    var providerResult: ProviderResult<AgentSummary?>
+}
+
+struct CodexSessionParser: Sendable {
     let fileURL: URL
-    let now: Date
+    var now: Date
     var diagnostics: [String] = []
     var sessionID: String?
     var cwd: String?
@@ -166,6 +400,7 @@ struct CodexSessionParser {
     var updatedAt: Date?
     var tokenUsage: TokenUsage?
     var didError = false
+    fileprivate var activity: ProviderActivity = .unknown
     var tools: [String: ToolCallSummary] = [:]
     var toolOrder: [String] = []
     var lineNumber = 0
@@ -222,14 +457,29 @@ struct CodexSessionParser {
             || line.contains("\"event_msg\"")
             || line.contains("\"function_call\"")
             || line.contains("\"function_call_output\"")
+            || line.contains("\"custom_tool_call\"")
+            || line.contains("\"custom_tool_call_output\"")
+            || line.contains("\"tool_search_call\"")
+            || line.contains("\"tool_search_output\"")
             || line.contains("\"web_search_call\"")
+            || line.contains("\"web_search_end\"")
     }
 
     mutating func parseEventMessage(_ payload: JSONDictionary, timestamp: Date?) {
         let eventType = JSONHelpers.string(payload, keys: ["type"])
         switch eventType {
         case "task_started":
+            activity = .active
             title = title ?? JSONHelpers.string(payload, keys: ["title", "summary"]).map { JSONHelpers.truncatedTitle($0) }
+        case "task_complete":
+            activity = .finished
+        case "turn_aborted":
+            if hasErrorMarker(payload) {
+                didError = true
+                activity = .errored
+            } else {
+                activity = .finished
+            }
         case "token_count":
             let info = JSONHelpers.dictionary(payload, key: "info")
             tokenUsage = JSONHelpers.tokenUsage(from: JSONHelpers.dictionary(info ?? [:], key: "total_token_usage"))
@@ -240,9 +490,14 @@ struct CodexSessionParser {
                 ?? JSONHelpers.int(JSONHelpers.dictionary(payload, key: "info") ?? [:], keys: ["exit_code", "exitCode"])
             if let exitCode, exitCode != 0 {
                 didError = true
+                activity = .errored
             }
             closeTool(id: JSONHelpers.string(payload, keys: ["call_id", "callId", "id"]), at: timestamp)
         default:
+            if eventType?.localizedCaseInsensitiveContains("error") == true || hasErrorMarker(payload) {
+                didError = true
+                activity = .errored
+            }
             break
         }
     }
@@ -251,39 +506,82 @@ struct CodexSessionParser {
         let itemType = JSONHelpers.string(payload, keys: ["type"])
         switch itemType {
         case "function_call":
-            let id = JSONHelpers.string(payload, keys: ["call_id", "callId", "id"]) ?? UUID().uuidString
-            let name = JSONHelpers.string(payload, keys: ["name"]) ?? "tool"
-            tools[id] = ToolCallSummary(
-                id: id,
-                name: name,
-                status: "running",
-                startedAt: timestamp,
-                completedAt: nil,
-                ageSeconds: timestamp.map { max(0, now.timeIntervalSince($0)) }
+            startTool(
+                id: JSONHelpers.string(payload, keys: ["call_id", "callId", "id"]),
+                name: JSONHelpers.string(payload, keys: ["name"]) ?? "tool",
+                status: JSONHelpers.string(payload, keys: ["status"]) ?? "running",
+                at: timestamp
             )
-            toolOrder.append(id)
         case "function_call_output":
             if JSONHelpers.string(payload, keys: ["error"]) != nil {
                 didError = true
+                activity = .errored
+            }
+            closeTool(id: JSONHelpers.string(payload, keys: ["call_id", "callId", "id"]), at: timestamp)
+        case "custom_tool_call":
+            startTool(
+                id: JSONHelpers.string(payload, keys: ["call_id", "callId", "id"]),
+                name: JSONHelpers.string(payload, keys: ["name"]) ?? "custom tool",
+                status: JSONHelpers.string(payload, keys: ["status"]) ?? "running",
+                at: timestamp
+            )
+        case "custom_tool_call_output":
+            if hasErrorMarker(payload) {
+                didError = true
+                activity = .errored
+            }
+            closeTool(id: JSONHelpers.string(payload, keys: ["call_id", "callId", "id"]), at: timestamp)
+        case "tool_search_call":
+            startTool(
+                id: JSONHelpers.string(payload, keys: ["call_id", "callId", "id"]),
+                name: "tool search",
+                status: JSONHelpers.string(payload, keys: ["status"]) ?? "running",
+                at: timestamp
+            )
+        case "tool_search_output":
+            if hasErrorMarker(payload) {
+                didError = true
+                activity = .errored
             }
             closeTool(id: JSONHelpers.string(payload, keys: ["call_id", "callId", "id"]), at: timestamp)
         case "message":
             break
         case "web_search_call":
-            let id = JSONHelpers.string(payload, keys: ["id", "call_id", "callId"]) ?? UUID().uuidString
             let status = JSONHelpers.string(payload, keys: ["status"]) ?? "running"
-            let completedAt = status == "completed" ? timestamp : nil
-            tools[id] = ToolCallSummary(
-                id: id,
+            startTool(
+                id: JSONHelpers.string(payload, keys: ["id", "call_id", "callId"]),
                 name: "web search",
                 status: status,
-                startedAt: timestamp,
-                completedAt: completedAt,
-                ageSeconds: completedAt == nil ? timestamp.map { max(0, now.timeIntervalSince($0)) } : nil
+                at: timestamp
             )
-            toolOrder.append(id)
+            if status == "completed" {
+                closeTool(id: JSONHelpers.string(payload, keys: ["id", "call_id", "callId"]), at: timestamp)
+            }
+        case "web_search_end":
+            closeTool(id: JSONHelpers.string(payload, keys: ["id", "call_id", "callId"]), at: timestamp)
         default:
+            if hasErrorMarker(payload) {
+                didError = true
+                activity = .errored
+            }
             break
+        }
+    }
+
+    mutating func startTool(id: String?, name: String, status: String, at timestamp: Date?) {
+        activity = .active
+        let key = id ?? UUID().uuidString
+        let completedAt = status.lowercased() == "completed" ? timestamp : nil
+        tools[key] = ToolCallSummary(
+            id: key,
+            name: name,
+            status: status,
+            startedAt: timestamp,
+            completedAt: completedAt,
+            ageSeconds: completedAt == nil ? timestamp.map { max(0, now.timeIntervalSince($0)) } : nil
+        )
+        if !toolOrder.contains(key) {
+            toolOrder.append(key)
         }
     }
 
@@ -312,6 +610,19 @@ struct CodexSessionParser {
         tools[key] = tool
     }
 
+    func hasErrorMarker(_ payload: JSONDictionary) -> Bool {
+        if payload["error"] != nil {
+            return true
+        }
+        if JSONHelpers.string(payload, keys: ["status", "reason"])?.localizedCaseInsensitiveContains("error") == true {
+            return true
+        }
+        if JSONHelpers.string(payload, keys: ["message"])?.localizedCaseInsensitiveContains("error") == true {
+            return true
+        }
+        return false
+    }
+
     func summary() -> AgentSummary? {
         let fileModified = (try? fileURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
         let lastActivityAt = [updatedAt, fileModified].compactMap { $0 }.max()
@@ -331,12 +642,32 @@ struct CodexSessionParser {
             provider: .codex,
             title: title?.isEmpty == false ? title! : fallbackTitle,
             cwd: cwd,
-            status: didError ? .error : .unknown,
+            status: didError ? .error : activity.agentStatus,
             startedAt: createdAt ?? fileModified,
             lastActivityAt: lastActivityAt,
             tokenUsage: tokenUsage,
             activeTool: activeTool,
             diagnostics: diagnostics
         )
+    }
+}
+
+fileprivate enum ProviderActivity: Sendable {
+    case active
+    case finished
+    case errored
+    case unknown
+
+    var agentStatus: AgentStatus {
+        switch self {
+        case .active:
+            .running
+        case .finished:
+            .complete
+        case .errored:
+            .error
+        case .unknown:
+            .unknown
+        }
     }
 }

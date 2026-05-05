@@ -5,21 +5,34 @@ public protocol OpenCodeSessionStoring: Sendable {
     func summaries(now: Date) -> ProviderResult<[AgentSummary]>
 }
 
-public final class OpenCodeSessionStore: OpenCodeSessionStoring, @unchecked Sendable {
+public final class OpenCodeSessionStore: OpenCodeSessionStoring, ModeAwareOpenCodeSessionStoring, @unchecked Sendable {
     let databaseURL: URL
     let sessionLimit: Int
+    let detailCandidateLimit: Int
     private let cacheLock = NSLock()
     private var detailCache: [String: OpenCodeCachedSummary] = [:]
+    private var databaseCache: OpenCodeDatabaseCache?
 
     public init(
         databaseURL: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/share/opencode/opencode.db"),
-        sessionLimit: Int = 50
+        sessionLimit: Int = 50,
+        detailCandidateLimit: Int = 8
     ) {
         self.databaseURL = databaseURL
         self.sessionLimit = sessionLimit
+        self.detailCandidateLimit = detailCandidateLimit
     }
 
     public func summaries(now: Date) -> ProviderResult<[AgentSummary]> {
+        summaries(now: now, mode: .bounded)
+    }
+
+    public func summaries(now: Date, mode: SessionRefreshMode) -> ProviderResult<[AgentSummary]> {
+        let metadata = databaseMetadata()
+        if let cached = cachedDatabaseResult(metadata: metadata, now: now, mode: mode) {
+            return cached
+        }
+
         var db: OpaquePointer?
         let uri = "file:\(databaseURL.path)?mode=ro"
         let flags = SQLITE_OPEN_READONLY | SQLITE_OPEN_URI
@@ -28,39 +41,105 @@ public final class OpenCodeSessionStore: OpenCodeSessionStoring, @unchecked Send
             if db != nil {
                 sqlite3_close(db)
             }
-            return ProviderResult(value: [], diagnostics: [Diagnostics.openCode("\(Diagnostics.openCodeDBBusy): \(message)")])
+            let result = ProviderResult<[AgentSummary]>(value: [], diagnostics: [Diagnostics.openCode("\(Diagnostics.openCodeDBBusy): \(message)")])
+            storeDatabaseResult(result, metadata: metadata, mode: mode)
+            return result
         }
         defer { sqlite3_close(db) }
         sqlite3_busy_timeout(db, 250)
 
         var diagnostics: [String] = []
         var summaries: [AgentSummary] = []
+        var metrics = ProviderMetrics()
 
-        let sessions = querySessions(db: db, diagnostics: &diagnostics)
+        let sessions = querySessions(db: db, diagnostics: &diagnostics, metrics: &metrics)
         pruneCache(keeping: sessions)
-        for session in sessions {
+        for (index, session) in sessions.enumerated() {
             if let cached = cachedSummary(for: session, now: now) {
                 summaries.append(cached)
+                continue
+            }
+            if mode == .bounded, index >= detailCandidateLimit {
+                summaries.append(metadataOnlySummary(session: session))
                 continue
             }
             let parts = queryJSONRows(
                 db: db,
                 sql: "select data, time_created, time_updated from part where session_id = ? order by time_updated desc limit 200",
                 sessionID: session.id,
-                diagnostics: &diagnostics
+                diagnostics: &diagnostics,
+                metrics: &metrics
             )
             let messages = queryJSONRows(
                 db: db,
                 sql: "select data, time_created, time_updated from message where session_id = ? order by time_updated desc limit 50",
                 sessionID: session.id,
-                diagnostics: &diagnostics
+                diagnostics: &diagnostics,
+                metrics: &metrics
             )
             let summary = summarize(session: session, parts: parts, messages: messages, now: now)
             storeCachedSummary(summary, for: session)
             summaries.append(summary)
         }
 
-        return ProviderResult(value: summaries, diagnostics: diagnostics)
+        let result = ProviderResult(value: summaries, diagnostics: diagnostics, metrics: metrics)
+        storeDatabaseResult(result, metadata: metadata, mode: mode)
+        return result
+    }
+
+    private func cachedDatabaseResult(
+        metadata: OpenCodeDatabaseMetadata?,
+        now: Date,
+        mode: SessionRefreshMode
+    ) -> ProviderResult<[AgentSummary]>? {
+        guard let metadata else {
+            return nil
+        }
+        cacheLock.lock()
+        let cached = databaseCache
+        cacheLock.unlock()
+        guard let cached, cached.metadata == metadata else {
+            return nil
+        }
+        guard mode == .bounded || cached.mode == .deep else {
+            return nil
+        }
+        return cached.result.refreshedDynamicFields(now: now)
+    }
+
+    private func storeDatabaseResult(
+        _ result: ProviderResult<[AgentSummary]>,
+        metadata: OpenCodeDatabaseMetadata?,
+        mode: SessionRefreshMode
+    ) {
+        guard let metadata else {
+            return
+        }
+        cacheLock.lock()
+        databaseCache = OpenCodeDatabaseCache(metadata: metadata, mode: mode, result: result)
+        cacheLock.unlock()
+    }
+
+    private func databaseMetadata() -> OpenCodeDatabaseMetadata? {
+        guard FileManager.default.fileExists(atPath: databaseURL.path) else {
+            return nil
+        }
+        let urls = [
+            databaseURL,
+            URL(fileURLWithPath: databaseURL.path + "-wal"),
+            URL(fileURLWithPath: databaseURL.path + "-shm")
+        ]
+        return OpenCodeDatabaseMetadata(
+            files: urls.map { url in
+                let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
+                return OpenCodeFileMetadata(
+                    path: url.path,
+                    exists: FileManager.default.fileExists(atPath: url.path),
+                    modifiedAt: values?.contentModificationDate,
+                    size: values?.fileSize.map(Int64.init)
+                )
+            }
+        )
     }
 
     private func cachedSummary(for session: OpenCodeSessionRow, now: Date) -> AgentSummary? {
@@ -92,9 +171,10 @@ public final class OpenCodeSessionStore: OpenCodeSessionStoring, @unchecked Send
         cacheLock.unlock()
     }
 
-    func querySessions(db: OpaquePointer, diagnostics: inout [String]) -> [OpenCodeSessionRow] {
+    func querySessions(db: OpaquePointer, diagnostics: inout [String], metrics: inout ProviderMetrics) -> [OpenCodeSessionRow] {
         var statement: OpaquePointer?
         let sql = "select id, title, directory, time_created, time_updated from session order by time_updated desc limit ?"
+        metrics.sqliteQueries += 1
         guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK, let statement else {
             diagnostics.append(Diagnostics.openCode("session query failed: \(String(cString: sqlite3_errmsg(db)))"))
             return []
@@ -122,9 +202,11 @@ public final class OpenCodeSessionStore: OpenCodeSessionStoring, @unchecked Send
         db: OpaquePointer,
         sql: String,
         sessionID: String,
-        diagnostics: inout [String]
+        diagnostics: inout [String],
+        metrics: inout ProviderMetrics
     ) -> [OpenCodeJSONRow] {
         var statement: OpaquePointer?
+        metrics.sqliteQueries += 1
         guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK, let statement else {
             diagnostics.append(Diagnostics.openCode("detail query failed: \(String(cString: sqlite3_errmsg(db)))"))
             return []
@@ -146,6 +228,18 @@ public final class OpenCodeSessionStore: OpenCodeSessionStoring, @unchecked Send
         return rows
     }
 
+    func metadataOnlySummary(session: OpenCodeSessionRow) -> AgentSummary {
+        AgentSummary(
+            id: session.id,
+            provider: .opencode,
+            title: JSONHelpers.truncatedTitle(session.title ?? "OpenCode - \(AgentFormatters.formatPathBasename(session.directory))"),
+            cwd: session.directory,
+            status: .unknown,
+            startedAt: session.createdAt,
+            lastActivityAt: session.updatedAt
+        )
+    }
+
     func summarize(
         session: OpenCodeSessionRow,
         parts: [OpenCodeJSONRow],
@@ -156,7 +250,7 @@ public final class OpenCodeSessionStore: OpenCodeSessionStoring, @unchecked Send
         var costUSD: Decimal?
         var activeTool: ToolCallSummary?
         var didError = false
-        var didFinish = false
+        var activity: ProviderActivity = .unknown
         var diagnostics: [String] = []
 
         for row in parts {
@@ -170,10 +264,19 @@ public final class OpenCodeSessionStore: OpenCodeSessionStoring, @unchecked Send
                 costUSD = JSONHelpers.decimal(json, keys: ["cost"]) ?? costUSD
                 if JSONHelpers.string(json, keys: ["reason"]) == "error" {
                     didError = true
+                    activity = .errored
                 }
             }
             if type == "tool", activeTool == nil {
-                activeTool = parseTool(json, row: row, now: now)
+                let toolState = parseToolState(json, row: row, now: now)
+                if toolState.isError {
+                    didError = true
+                    activity = .errored
+                }
+                activeTool = toolState.tool
+                if toolState.isActive {
+                    activity = .active
+                }
             }
             if costUSD == nil {
                 costUSD = JSONHelpers.decimal(json, keys: ["cost"])
@@ -189,9 +292,22 @@ public final class OpenCodeSessionStore: OpenCodeSessionStoring, @unchecked Send
             costUSD = JSONHelpers.decimal(json, keys: ["cost"]) ?? costUSD
             if json["error"] != nil {
                 didError = true
+                activity = .errored
             }
-            if json["finish"] != nil {
-                didFinish = true
+            switch finishState(json) {
+            case .active:
+                if activity != .errored {
+                    activity = .active
+                }
+            case .finished:
+                if activity != .errored {
+                    activity = .finished
+                }
+            case .errored:
+                didError = true
+                activity = .errored
+            case .unknown:
+                break
             }
         }
 
@@ -200,7 +316,7 @@ public final class OpenCodeSessionStore: OpenCodeSessionStoring, @unchecked Send
             provider: .opencode,
             title: JSONHelpers.truncatedTitle(session.title ?? "OpenCode - \(AgentFormatters.formatPathBasename(session.directory))"),
             cwd: session.directory,
-            status: didError ? .error : (didFinish ? .complete : .unknown),
+            status: didError ? .error : activity.agentStatus,
             startedAt: session.createdAt,
             lastActivityAt: session.updatedAt,
             tokenUsage: tokenUsage,
@@ -211,13 +327,20 @@ public final class OpenCodeSessionStore: OpenCodeSessionStoring, @unchecked Send
     }
 
     func parseTool(_ json: JSONDictionary, row: OpenCodeJSONRow, now: Date) -> ToolCallSummary? {
+        parseToolState(json, row: row, now: now).tool
+    }
+
+    func parseToolState(_ json: JSONDictionary, row: OpenCodeJSONRow, now: Date) -> OpenCodeToolState {
         let state = JSONHelpers.dictionary(json, key: "state") ?? [:]
         let status = JSONHelpers.string(state, keys: ["status"]) ?? "running"
         let time = JSONHelpers.dictionary(state, key: "time") ?? JSONHelpers.dictionary(json, key: "time") ?? [:]
         let start = JSONHelpers.date(time["start"]) ?? row.createdAt
         let end = JSONHelpers.date(time["end"])
+        if status.localizedCaseInsensitiveContains("error") {
+            return OpenCodeToolState(tool: nil, isActive: false, isError: true)
+        }
         guard status != "completed", end == nil else {
-            return nil
+            return OpenCodeToolState(tool: nil, isActive: false, isError: false)
         }
         let toolValue = json["tool"]
         let name: String
@@ -228,14 +351,33 @@ public final class OpenCodeSessionStore: OpenCodeSessionStoring, @unchecked Send
         } else {
             name = JSONHelpers.string(json, keys: ["name"]) ?? "tool"
         }
-        return ToolCallSummary(
+        return OpenCodeToolState(tool: ToolCallSummary(
             id: JSONHelpers.string(json, keys: ["callID", "callId", "id"]),
             name: name,
             status: status,
             startedAt: start,
             completedAt: nil,
             ageSeconds: start.map { max(0, now.timeIntervalSince($0)) }
-        )
+        ), isActive: true, isError: false)
+    }
+
+    fileprivate func finishState(_ json: JSONDictionary) -> ProviderActivity {
+        guard let finish = JSONHelpers.string(json, keys: ["finish"])?.lowercased() else {
+            if JSONHelpers.bool(json, keys: ["finish"]) == false {
+                return .unknown
+            }
+            return .unknown
+        }
+        switch finish {
+        case "tool-calls":
+            return .active
+        case "stop", "length", "other":
+            return .finished
+        case "error":
+            return .errored
+        default:
+            return .unknown
+        }
     }
 
     func columnString(_ statement: OpaquePointer, _ index: Int32) -> String? {
@@ -263,6 +405,49 @@ struct OpenCodeJSONRow: Sendable {
 private struct OpenCodeCachedSummary: Sendable {
     var updatedAt: Date?
     var summary: AgentSummary
+}
+
+private struct OpenCodeFileMetadata: Equatable, Sendable {
+    var path: String
+    var exists: Bool
+    var modifiedAt: Date?
+    var size: Int64?
+}
+
+private struct OpenCodeDatabaseMetadata: Equatable, Sendable {
+    var files: [OpenCodeFileMetadata]
+}
+
+private struct OpenCodeDatabaseCache: Sendable {
+    var metadata: OpenCodeDatabaseMetadata
+    var mode: SessionRefreshMode
+    var result: ProviderResult<[AgentSummary]>
+}
+
+struct OpenCodeToolState: Sendable {
+    var tool: ToolCallSummary?
+    var isActive: Bool
+    var isError: Bool
+}
+
+fileprivate enum ProviderActivity: Sendable {
+    case active
+    case finished
+    case errored
+    case unknown
+
+    var agentStatus: AgentStatus {
+        switch self {
+        case .active:
+            .running
+        case .finished:
+            .complete
+        case .errored:
+            .error
+        case .unknown:
+            .unknown
+        }
+    }
 }
 
 let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)

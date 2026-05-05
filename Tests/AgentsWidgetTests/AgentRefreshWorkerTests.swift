@@ -27,6 +27,26 @@ final class AgentRefreshWorkerTests: XCTestCase {
         XCTAssertEqual(codexStore.callCount, 2)
         XCTAssertEqual(openCodeStore.callCount, 2)
     }
+
+    func testProcessOnlyRefreshSkipsSessionStores() async {
+        let processProvider = CountingProcessProvider()
+        let codexStore = CountingCodexStore(provider: .codex)
+        let openCodeStore = CountingOpenCodeStore(provider: .opencode)
+        let worker = AgentRefreshWorker(
+            processProvider: processProvider,
+            codexStore: codexStore,
+            openCodeStore: openCodeStore,
+            detailRefreshInterval: 60
+        )
+        let now = Date(timeIntervalSince1970: 1_000)
+
+        _ = await worker.refresh(now: now, forceDetails: true)
+        _ = await worker.refreshProcesses(now: now.addingTimeInterval(1))
+
+        XCTAssertEqual(processProvider.callCount, 2)
+        XCTAssertEqual(codexStore.callCount, 1)
+        XCTAssertEqual(openCodeStore.callCount, 1)
+    }
 }
 
 private final class CountingProcessProvider: ProcessSnapshotProviding, @unchecked Sendable {

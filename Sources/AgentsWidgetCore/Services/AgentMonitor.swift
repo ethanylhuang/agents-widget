@@ -20,21 +20,34 @@ public final class AgentMonitor: ObservableObject {
     @Published public private(set) var lastRefreshDuration: TimeInterval?
     @Published public private(set) var isRefreshing = false
     @Published public private(set) var diagnostics: [String] = []
+    @Published public private(set) var lastRefreshProfile: RefreshProfile?
 
     private let worker: AgentRefreshWorker
     private let dateProvider: any DateProviding
-    private var pollingTask: Task<Void, Never>?
+    private let eventSource: (any AgentEventSourcing)?
+    private let eventDebounceNanoseconds: UInt64
+    private let menuCloseGraceNanoseconds: UInt64
+    private var eventDebounceTask: Task<Void, Never>?
+    private var menuCloseTask: Task<Void, Never>?
     private var activeRefreshTask: Task<AgentRefreshResult, Never>?
-    private var pendingRefresh = false
-    private var pendingForceDetails = false
-    private var pollingIntervalSeconds: UInt64 = 10
+    private var pendingRefreshScope: RefreshScope?
+    private var pendingDebouncedScope: RefreshScope?
+    private var processExitWatchers: [Int32: DispatchSourceProcess] = [:]
+    private var didStart = false
+    private var isMenuVisible = false
+    private var isEventSourceRunning = false
 
     public init(
         processProvider: any ProcessSnapshotProviding,
         codexStore: any CodexSessionStoring,
         openCodeStore: any OpenCodeSessionStoring,
         dateProvider: any DateProviding = SystemDateProvider(),
-        detailRefreshInterval: TimeInterval = 10
+        detailRefreshInterval: TimeInterval = 10,
+        eventSource: (any AgentEventSourcing)? = nil,
+        eventDebounceNanoseconds: UInt64 = 250_000_000,
+        menuTickIntervalNanoseconds: UInt64 = 2_000_000_000,
+        menuOpenRefreshThrottleInterval: TimeInterval = 60,
+        menuCloseGraceNanoseconds: UInt64 = 3_000_000_000
     ) {
         self.worker = AgentRefreshWorker(
             processProvider: processProvider,
@@ -43,47 +56,80 @@ public final class AgentMonitor: ObservableObject {
             detailRefreshInterval: detailRefreshInterval
         )
         self.dateProvider = dateProvider
+        self.eventSource = eventSource
+        self.eventDebounceNanoseconds = eventDebounceNanoseconds
+        self.menuCloseGraceNanoseconds = menuCloseGraceNanoseconds
+        _ = menuTickIntervalNanoseconds
+        _ = menuOpenRefreshThrottleInterval
     }
 
     public static func live() -> AgentMonitor {
         AgentMonitor(
             processProvider: ProcessSnapshotProvider(),
             codexStore: CodexSessionStore(),
-            openCodeStore: OpenCodeSessionStore()
+            openCodeStore: OpenCodeSessionStore(),
+            eventSource: LocalAgentEventSource()
         )
     }
 
     public func start() {
-        guard pollingTask == nil else {
+        guard !didStart else {
             return
         }
-        requestRefresh()
-        pollingTask = Task { [weak self] in
-            while !Task.isCancelled {
-                let seconds = self?.pollingIntervalSeconds ?? 10
-                try? await Task.sleep(for: .seconds(seconds))
-                self?.requestRefresh()
-            }
-        }
+        didStart = true
     }
 
     public func stop() {
-        pollingTask?.cancel()
-        pollingTask = nil
+        didStart = false
+        menuCloseTask?.cancel()
+        menuCloseTask = nil
+        stopEventSource()
+        eventDebounceTask?.cancel()
+        eventDebounceTask = nil
+        pendingDebouncedScope = nil
+        stopProcessExitWatchers()
     }
 
     public func setPollingInterval(_ seconds: UInt64) {
-        pollingIntervalSeconds = seconds
+        _ = seconds
     }
 
     public func setMenuVisible(_ isVisible: Bool) {
-        pollingIntervalSeconds = isVisible ? 2 : 10
+        isMenuVisible = isVisible
+        guard didStart else {
+            return
+        }
+        if isVisible {
+            menuCloseTask?.cancel()
+            menuCloseTask = nil
+        } else {
+            scheduleHiddenTeardown()
+        }
     }
 
     public func requestRefresh(force: Bool = false) {
+        requestRefresh(scope: .full(
+            forceDetails: force,
+            mode: force ? .deep : .bounded,
+            reason: force ? .manual : .menuOpen
+        ))
+    }
+
+    public func warmCache() {
+        requestRefresh(scope: .full(
+            forceDetails: false,
+            mode: .bounded,
+            reason: .startup
+        ))
+    }
+
+    private func requestProcessRefresh(reason: AgentRefreshReason) {
+        requestRefresh(scope: .processOnly(reason: reason))
+    }
+
+    private func requestRefresh(scope: RefreshScope) {
         guard activeRefreshTask == nil else {
-            pendingRefresh = true
-            pendingForceDetails = pendingForceDetails || force
+            pendingRefreshScope = pendingRefreshScope?.merged(with: scope) ?? scope
             return
         }
 
@@ -91,7 +137,12 @@ public final class AgentMonitor: ObservableObject {
         let now = dateProvider.now()
         let refreshWorker = worker
         let task = Task.detached(priority: .utility) {
-            await refreshWorker.refresh(now: now, forceDetails: force)
+            switch scope {
+            case .full(let forceDetails, let mode, let reason):
+                await refreshWorker.refresh(now: now, forceDetails: forceDetails, mode: mode, reason: reason)
+            case .processOnly(let reason):
+                await refreshWorker.refreshProcesses(now: now, reason: reason)
+            }
         }
         activeRefreshTask = task
 
@@ -103,13 +154,13 @@ public final class AgentMonitor: ObservableObject {
 
     public func refresh() async {
         guard activeRefreshTask == nil else {
-            pendingRefresh = true
-            pendingForceDetails = true
+            let scope = RefreshScope.full(forceDetails: true, mode: .deep, reason: .manual)
+            pendingRefreshScope = pendingRefreshScope?.merged(with: scope) ?? scope
             return
         }
 
         isRefreshing = true
-        let result = await worker.refresh(now: dateProvider.now(), forceDetails: true)
+        let result = await worker.refresh(now: dateProvider.now(), forceDetails: true, mode: .deep, reason: .manual)
         completeRefresh(result)
     }
 
@@ -118,16 +169,127 @@ public final class AgentMonitor: ObservableObject {
         diagnostics = result.diagnostics
         lastRefreshAt = result.refreshedAt
         lastRefreshDuration = result.duration
+        lastRefreshProfile = result.profile
         activeRefreshTask = nil
+        updateProcessExitWatchers(for: result.agents)
 
-        if pendingRefresh {
-            let forceDetails = pendingForceDetails
-            pendingRefresh = false
-            pendingForceDetails = false
-            requestRefresh(force: forceDetails)
+        if let pendingRefreshScope {
+            self.pendingRefreshScope = nil
+            requestRefresh(scope: pendingRefreshScope)
         } else {
             isRefreshing = false
         }
+    }
+
+    func handleEvent(_ trigger: AgentRefreshTrigger) {
+        guard didStart, isMenuVisible else {
+            return
+        }
+        let scope = RefreshScope(trigger: trigger)
+        pendingDebouncedScope = pendingDebouncedScope?.merged(with: scope) ?? scope
+        eventDebounceTask?.cancel()
+        eventDebounceTask = Task { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: self?.eventDebounceNanoseconds ?? 250_000_000)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else {
+                return
+            }
+            await MainActor.run {
+                guard let self else {
+                    return
+                }
+                guard let scope = self.pendingDebouncedScope else {
+                    return
+                }
+                self.pendingDebouncedScope = nil
+                self.requestRefresh(scope: scope)
+            }
+        }
+    }
+
+    private func startEventSourceIfNeeded() {
+        guard !isEventSourceRunning else {
+            return
+        }
+        eventSource?.start { [weak self] trigger in
+            Task { @MainActor [weak self] in
+                self?.handleEvent(trigger)
+            }
+        }
+        isEventSourceRunning = eventSource != nil
+    }
+
+    private func stopEventSource() {
+        guard isEventSourceRunning else {
+            return
+        }
+        eventSource?.stop()
+        isEventSourceRunning = false
+    }
+
+    private func scheduleHiddenTeardown() {
+        eventDebounceTask?.cancel()
+        eventDebounceTask = nil
+        pendingDebouncedScope = nil
+        menuCloseTask?.cancel()
+
+        guard menuCloseGraceNanoseconds > 0 else {
+            stopEventSource()
+            stopProcessExitWatchers()
+            return
+        }
+
+        let delay = menuCloseGraceNanoseconds
+        menuCloseTask = Task { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: delay)
+            } catch {
+                return
+            }
+            await MainActor.run {
+                guard let self, !self.isMenuVisible else {
+                    return
+                }
+                self.menuCloseTask = nil
+                self.stopEventSource()
+                self.stopProcessExitWatchers()
+            }
+        }
+    }
+
+    private func updateProcessExitWatchers(for agents: [AgentSummary]) {
+        guard isMenuVisible else {
+            stopProcessExitWatchers()
+            return
+        }
+        let activePIDs = Set(agents.compactMap(\.pid))
+        for (pid, watcher) in processExitWatchers where !activePIDs.contains(pid) {
+            watcher.cancel()
+            processExitWatchers[pid] = nil
+        }
+
+        for pid in activePIDs where processExitWatchers[pid] == nil {
+            let watcher = DispatchSource.makeProcessSource(
+                identifier: pid_t(pid),
+                eventMask: .exit,
+                queue: .main
+            )
+            watcher.setEventHandler { [weak self] in
+                self?.handleEvent(.processExited(pid))
+            }
+            processExitWatchers[pid] = watcher
+            watcher.resume()
+        }
+    }
+
+    private func stopProcessExitWatchers() {
+        for watcher in processExitWatchers.values {
+            watcher.cancel()
+        }
+        processExitWatchers = [:]
     }
 
     public func merge(
@@ -156,7 +318,7 @@ public final class AgentMonitor: ObservableObject {
 
         for session in unmatchedSessions {
             var summary = session
-            summary.status = status(for: summary, hasProcess: false, now: now)
+            summary.status = status(for: summary, hasProcess: false, hasSession: true, now: now)
             summary.runtimeSeconds = runtime(startedAt: summary.startedAt, now: now)
             summary.idleSeconds = idle(lastActivityAt: summary.lastActivityAt, now: now)
             merged.append(summary)
@@ -200,7 +362,7 @@ public final class AgentMonitor: ObservableObject {
         if let tty = process.tty {
             summary.terminalTarget = TerminalTarget(tty: tty, pid: process.pid)
         }
-        summary.status = status(for: summary, hasProcess: true, now: now)
+        summary.status = status(for: summary, hasProcess: true, hasSession: true, now: now)
     }
 
     nonisolated static func summary(for process: ProcessSnapshot, now: Date) -> AgentSummary {
@@ -211,7 +373,7 @@ public final class AgentMonitor: ObservableObject {
             cwd: process.cwd,
             pid: process.pid,
             tty: process.tty,
-            status: .running,
+            status: .unknown,
             startedAt: process.startedAt,
             lastActivityAt: process.startedAt,
             runtimeSeconds: runtime(startedAt: process.startedAt, now: now),
@@ -220,24 +382,31 @@ public final class AgentMonitor: ObservableObject {
         if let tty = process.tty {
             summary.terminalTarget = TerminalTarget(tty: tty, pid: process.pid)
         }
-        summary.status = status(for: summary, hasProcess: true, now: now)
+        summary.status = status(for: summary, hasProcess: true, hasSession: false, now: now)
         return summary
     }
 
-    nonisolated static func status(for summary: AgentSummary, hasProcess: Bool, now: Date) -> AgentStatus {
-        if hasProcess,
-           let tool = summary.activeTool,
-           tool.isIncomplete,
-           (tool.ageSeconds ?? tool.startedAt.map { now.timeIntervalSince($0) } ?? 0) >= 90 {
-            return .stuck
+    nonisolated static func status(for summary: AgentSummary, hasProcess: Bool, hasSession: Bool, now: Date) -> AgentStatus {
+        let hasActiveTool = summary.activeTool?.isIncomplete == true
+
+        if hasProcess, hasActiveTool {
+            let activeAge = summary.activeTool.flatMap { tool in
+                tool.ageSeconds ?? tool.startedAt.map { now.timeIntervalSince($0) }
+            } ?? idle(lastActivityAt: summary.lastActivityAt ?? summary.startedAt, now: now) ?? 0
+            return activeAge >= 90 ? .stuck : .running
         }
+
         if hasProcess {
-            let idleSeconds = idle(lastActivityAt: summary.lastActivityAt ?? summary.startedAt, now: now) ?? .greatestFiniteMagnitude
-            return idleSeconds < 120 ? .running : .idle
+            if !hasSession || summary.status == .complete {
+                return .idle
+            }
+            return .running
         }
+
         if summary.status == .error {
             return .error
         }
+
         if summary.status == .complete {
             return .complete
         }
@@ -267,5 +436,47 @@ public final class AgentMonitor: ObservableObject {
         case .unknown:
             5
         }
+    }
+}
+
+private enum RefreshScope: Equatable {
+    case full(forceDetails: Bool, mode: SessionRefreshMode, reason: AgentRefreshReason)
+    case processOnly(reason: AgentRefreshReason)
+
+    init(trigger: AgentRefreshTrigger) {
+        switch trigger {
+        case .codexSessionsChanged, .openCodeDatabaseChanged:
+            self = .full(forceDetails: false, mode: .bounded, reason: .providerDirty)
+        case .processExited:
+            self = .processOnly(reason: .processExit)
+        }
+    }
+
+    func merged(with other: RefreshScope) -> RefreshScope {
+        switch (self, other) {
+        case (.full(let lhsForce, let lhsMode, let lhsReason), .full(let rhsForce, let rhsMode, let rhsReason)):
+            .full(
+                forceDetails: lhsForce || rhsForce,
+                mode: lhsMode == .deep || rhsMode == .deep ? .deep : .bounded,
+                reason: Self.mergedReason(lhsReason, rhsReason)
+            )
+        case (.full(let force, let mode, let reason), .processOnly(let processReason)),
+             (.processOnly(let processReason), .full(let force, let mode, let reason)):
+            .full(forceDetails: force, mode: mode, reason: Self.mergedReason(reason, processReason))
+        case (.processOnly(let lhsReason), .processOnly(let rhsReason)):
+            .processOnly(reason: Self.mergedReason(lhsReason, rhsReason))
+        }
+    }
+
+    private static func mergedReason(_ lhs: AgentRefreshReason, _ rhs: AgentRefreshReason) -> AgentRefreshReason {
+        let priority: [AgentRefreshReason] = [
+            .manual,
+            .providerDirty,
+            .menuOpen,
+            .backgroundMaintenance,
+            .startup,
+            .processExit
+        ]
+        return priority.first { $0 == lhs || $0 == rhs } ?? lhs
     }
 }

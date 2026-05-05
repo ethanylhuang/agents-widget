@@ -1,31 +1,129 @@
 import AgentsWidgetCore
+import Darwin
 import Foundation
 import SwiftUI
 
 @main
 struct AgentsWidgetApp: App {
-    @StateObject private var monitor = AgentMonitor.live()
-    @State private var didStartMonitor = false
+    @StateObject private var monitor: AgentMonitor
 
     init() {
+        if CommandLine.arguments.contains("--profile-refresh") {
+            ProfileProbe.run()
+            Foundation.exit(0)
+        }
         if CommandLine.arguments.contains("--smoke-json") {
             SmokeProbe.run(attemptTerminalJump: CommandLine.arguments.contains("--smoke-terminal"))
             Foundation.exit(0)
+        }
+
+        let liveMonitor = AgentMonitor.live()
+        _monitor = StateObject(wrappedValue: liveMonitor)
+        Task { @MainActor in
+            liveMonitor.start()
+            liveMonitor.warmCache()
         }
     }
 
     var body: some Scene {
         MenuBarExtra("Agents Widget", systemImage: "terminal") {
             MenuBarRootView(monitor: monitor)
-                .onAppear {
-                    guard !didStartMonitor else {
-                        return
-                    }
-                    didStartMonitor = true
-                    monitor.start()
-                }
         }
         .menuBarExtraStyle(.window)
+    }
+}
+
+private enum ProfileProbe {
+    static func run() {
+        let processProvider = ProcessSnapshotProvider()
+        let codexStore = CodexSessionStore()
+        let openCodeStore = OpenCodeSessionStore()
+        let cold = refreshSnapshot(
+            processProvider: processProvider,
+            codexStore: codexStore,
+            openCodeStore: openCodeStore,
+            reason: .menuOpen
+        )
+        let warmSnapshots = (0..<20).map { _ in
+            refreshSnapshot(
+                processProvider: processProvider,
+                codexStore: codexStore,
+                openCodeStore: openCodeStore,
+                reason: .menuOpen
+            )
+        }
+        let warm = warmSnapshots.first ?? cold
+        let manualDeep = refreshSnapshot(
+            processProvider: processProvider,
+            codexStore: codexStore,
+            openCodeStore: openCodeStore,
+            mode: .deep,
+            reason: .manual
+        )
+        let report = ProfileReport(
+            profile: warm.profile,
+            coldProfile: cold.profile,
+            manualDeepProfile: manualDeep.profile,
+            warmLoop: ProfileLoopSummary(snapshots: warmSnapshots),
+            codexSessionCount: warm.codexSessionCount,
+            openCodeSessionCount: warm.openCodeSessionCount,
+            processCount: warm.processCount,
+            mergedAgentCount: warm.mergedAgentCount,
+            diagnostics: warm.diagnostics
+        )
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        if let data = try? encoder.encode(report), let text = String(data: data, encoding: .utf8) {
+            print(text)
+        } else {
+            print("{\"error\":\"profile report encoding failed\"}")
+        }
+    }
+
+    private static func refreshSnapshot(
+        processProvider: ProcessSnapshotProvider,
+        codexStore: CodexSessionStore,
+        openCodeStore: OpenCodeSessionStore,
+        mode: SessionRefreshMode = .bounded,
+        reason: AgentRefreshReason
+    ) -> ProfileSnapshot {
+        let now = Date()
+        let startedAt = Date()
+        let startedCPU = currentCPUTime()
+        let processes = processProvider.snapshots()
+        let codex = codexStore.summaries(now: now, mode: mode)
+        let openCode = openCodeStore.summaries(now: now, mode: mode)
+        let merged = AgentMonitor.merge(processes: processes.value, sessions: codex.value + openCode.value, now: now)
+        var metrics = processes.metrics
+        metrics.merge(codex.metrics)
+        metrics.merge(openCode.metrics)
+        let duration = Date().timeIntervalSince(startedAt)
+        let profile = RefreshProfile(
+            reason: reason,
+            wallTimeSeconds: duration,
+            cpuTimeSeconds: max(0, currentCPUTime() - startedCPU),
+            metrics: metrics
+        )
+
+        return ProfileSnapshot(
+            profile: profile,
+            codexSessionCount: codex.value.count,
+            openCodeSessionCount: openCode.value.count,
+            processCount: processes.value.count,
+            mergedAgentCount: merged.count,
+            diagnostics: processes.diagnostics + codex.diagnostics + openCode.diagnostics
+        )
+    }
+
+    private static func currentCPUTime() -> TimeInterval {
+        var usage = rusage()
+        guard getrusage(RUSAGE_SELF, &usage) == 0 else {
+            return 0
+        }
+        let user = TimeInterval(usage.ru_utime.tv_sec) + TimeInterval(usage.ru_utime.tv_usec) / 1_000_000
+        let system = TimeInterval(usage.ru_stime.tv_sec) + TimeInterval(usage.ru_stime.tv_usec) / 1_000_000
+        return user + system
     }
 }
 
@@ -128,6 +226,47 @@ private struct SmokeReport: Encodable {
     var agents: [SmokeAgent]
     var diagnostics: [String]
     var terminalJumpResult: String?
+}
+
+private struct ProfileReport: Encodable {
+    var profile: RefreshProfile
+    var coldProfile: RefreshProfile
+    var manualDeepProfile: RefreshProfile
+    var warmLoop: ProfileLoopSummary
+    var codexSessionCount: Int
+    var openCodeSessionCount: Int
+    var processCount: Int
+    var mergedAgentCount: Int
+    var diagnostics: [String]
+}
+
+private struct ProfileSnapshot {
+    var profile: RefreshProfile
+    var codexSessionCount: Int
+    var openCodeSessionCount: Int
+    var processCount: Int
+    var mergedAgentCount: Int
+    var diagnostics: [String]
+}
+
+private struct ProfileLoopSummary: Encodable {
+    var sampleCount: Int
+    var maxWallTimeSeconds: TimeInterval
+    var maxCPUTimeSeconds: TimeInterval
+    var maxBytesRead: Int64
+    var maxFilesParsed: Int
+    var maxSQLiteQueries: Int
+    var maxProcessSyscalls: Int
+
+    init(snapshots: [ProfileSnapshot]) {
+        sampleCount = snapshots.count
+        maxWallTimeSeconds = snapshots.map(\.profile.wallTimeSeconds).max() ?? 0
+        maxCPUTimeSeconds = snapshots.map(\.profile.cpuTimeSeconds).max() ?? 0
+        maxBytesRead = snapshots.map(\.profile.bytesRead).max() ?? 0
+        maxFilesParsed = snapshots.map(\.profile.filesParsed).max() ?? 0
+        maxSQLiteQueries = snapshots.map(\.profile.sqliteQueries).max() ?? 0
+        maxProcessSyscalls = snapshots.map(\.profile.processSyscalls).max() ?? 0
+    }
 }
 
 private struct SmokeAgent: Encodable {

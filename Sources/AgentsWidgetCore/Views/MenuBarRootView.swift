@@ -2,6 +2,8 @@ import AppKit
 import SwiftUI
 
 public struct MenuBarRootView: View {
+    private static let visibleAgentLimit = 12
+
     @ObservedObject private var monitor: AgentMonitor
     private let terminalJumpService: any TerminalJumping
     @State private var jumpDiagnostic: String?
@@ -25,10 +27,8 @@ public struct MenuBarRootView: View {
         }
         .frame(width: 360)
         .frame(maxHeight: 520)
-        .background(.regularMaterial)
         .onAppear {
             monitor.setMenuVisible(true)
-            monitor.requestRefresh()
         }
         .onDisappear {
             monitor.setMenuVisible(false)
@@ -76,7 +76,7 @@ public struct MenuBarRootView: View {
             } else {
                 ScrollView {
                     LazyVStack(spacing: 0) {
-                        ForEach(monitor.agents) { agent in
+                        ForEach(Array(monitor.agents.prefix(Self.visibleAgentLimit))) { agent in
                             AgentRowView(agent: agent) {
                                 Task {
                                     let result = await terminalJumpService.jump(to: agent.terminalTarget)
@@ -84,6 +84,14 @@ public struct MenuBarRootView: View {
                                 }
                             }
                             Divider()
+                        }
+                        if monitor.agents.count > Self.visibleAgentLimit {
+                            Text("\(monitor.agents.count - Self.visibleAgentLimit) more agents")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 10)
                         }
                     }
                 }

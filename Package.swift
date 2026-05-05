@@ -13,7 +13,8 @@ let package = Package(
         .target(
             name: "AgentsWidgetCore",
             linkerSettings: [
-                .linkedLibrary("sqlite3")
+                .linkedLibrary("sqlite3"),
+                .linkedFramework("CoreServices")
             ]
         ),
         .executableTarget(
